@@ -1,0 +1,3 @@
+{"timestamp":"2026-09-04T10:00:00Z","type":"session_meta","payload":{"id":"guardian-thread","cwd":"/workspace/demo","cli_version":"0.152.1","source":{"subagent":{"other":"guardian"}}}}
+{"timestamp":"2026-09-04T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"guardian-turn"}}
+{"timestamp":"2026-09-04T10:00:02Z","type":"response_item","payload":{"type":"message","id":"guardian-answer","role":"assistant","phase":"final","content":[{"type":"output_text","text":"Internal review complete."}]}}

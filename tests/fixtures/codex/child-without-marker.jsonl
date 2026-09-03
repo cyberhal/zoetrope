@@ -1,0 +1,2 @@
+{"timestamp":"2026-09-03T11:00:00Z","type":"session_meta","payload":{"id":"gated-child","cwd":"/workspace/demo","cli_version":"0.152.1","source":{"subagent":{"thread_spawn":{"parent_thread_id":"root-thread","agent_path":"/root/gated-child"}}}}}
+{"timestamp":"2026-09-03T11:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Ambiguous copied activity."}}

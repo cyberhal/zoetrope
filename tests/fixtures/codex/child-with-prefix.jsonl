@@ -1,0 +1,16 @@
+{"timestamp":"2026-09-03T10:00:00Z","type":"session_meta","payload":{"id":"child-thread","cwd":"/workspace/demo","cli_version":"0.152.1","source":{"subagent":{"thread_spawn":{"parent_thread_id":"root-thread","depth":1,"agent_path":"/root/child-a","agent_nickname":"Ada"}}}}}
+{"timestamp":"2026-09-03T10:00:00Z","type":"session_meta","payload":{"id":"copied-parent","cwd":"/workspace/other","cli_version":"0.152.1","source":"cli"}}
+{"timestamp":"2026-09-03T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"copied-turn"}}
+{"timestamp":"2026-09-03T10:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"This copied parent prompt must disappear."}}
+{"timestamp":"2026-09-03T10:00:03Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"copied-call","name":"exec","input":"{\"command\":\"do not count\"}"}}
+{"timestamp":"2026-09-03T10:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"output_tokens":999}}}}
+{"timestamp":"2026-09-03T10:00:05Z","type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"copied-spawn","kind":"started","agent_thread_id":"copied-grandchild","agent_path":"/root/copied"}}
+{"timestamp":"2026-09-03T10:00:06Z","type":"inter_agent_communication_metadata","payload":{"trigger_turn":false}}
+{"timestamp":"2026-09-03T10:00:06Z","type":"event_msg","payload":{"type":"user_message","message":"This copied prompt after a false marker must disappear."}}
+{"timestamp":"2026-09-03T10:00:07Z","type":"inter_agent_communication_metadata","payload":{"trigger_turn":true}}
+{"timestamp":"2026-09-03T10:00:08Z","type":"event_msg","payload":{"type":"task_started","turn_id":"owned-turn"}}
+{"timestamp":"2026-09-03T10:00:09Z","type":"turn_context","payload":{"turn_id":"owned-turn","model":"gpt-child"}}
+{"timestamp":"2026-09-03T10:00:10Z","type":"response_item","payload":{"type":"message","id":"owned-answer","role":"assistant","phase":"final","content":[{"type":"output_text","text":"Child-owned output."}]}}
+{"timestamp":"2026-09-03T10:00:11Z","type":"response_item","payload":{"type":"function_call","call_id":"nested-spawn","name":"spawn_agent","arguments":"{\"task_name\":\"grandchild\"}"}}
+{"timestamp":"2026-09-03T10:00:12Z","type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"nested-spawn","kind":"started","agent_thread_id":"grandchild-thread","agent_path":"/root/child-a/grandchild"}}
+{"timestamp":"2026-09-03T10:00:13Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20,"output_tokens":7,"reasoning_output_tokens":2}}}}

@@ -1,0 +1,28 @@
+{"timestamp":"2026-09-01T10:00:00Z","type":"session_meta","payload":{"id":"root-thread","cwd":"/workspace/demo","cli_version":"0.152.1","source":"cli"}}
+{"timestamp":"2026-09-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-root"}}
+{"timestamp":"2026-09-01T10:00:01Z","type":"response_item","payload":{"type":"message","id":"env","role":"user","content":[{"type":"input_text","text":"<environment_context>injected</environment_context>"}]}}
+{"timestamp":"2026-09-01T10:00:02Z","type":"response_item","payload":{"type":"message","id":"user-copy","role":"user","content":[{"type":"input_text","text":"Map the dependency graph."}]}}
+{"timestamp":"2026-09-01T10:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Map the dependency graph."}}
+{"timestamp":"2026-09-01T10:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Map the dependency graph."}}
+{"timestamp":"2026-09-01T10:00:03Z","type":"turn_context","payload":{"turn_id":"turn-root","cwd":"/workspace/demo","model":"gpt-test"}}
+{"timestamp":"2026-09-01T10:00:04Z","type":"response_item","payload":{"type":"message","id":"assistant-1","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"I will inspect the graph."}]}}
+{"timestamp":"2026-09-01T10:00:04Z","type":"response_item","payload":{"type":"message","id":"assistant-1","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"I will inspect the graph."}]}}
+{"timestamp":"2026-09-01T10:00:04Z","type":"event_msg","payload":{"type":"agent_message","message":"I will inspect the graph."}}
+{"timestamp":"2026-09-01T10:00:05Z","type":"response_item","payload":{"type":"reasoning","id":"reasoning-1","summary":[{"type":"summary_text","text":"The graph has one risky seam."}],"encrypted_content":"redacted"}}
+{"timestamp":"2026-09-01T10:00:05Z","type":"response_item","payload":{"type":"reasoning","id":"reasoning-1","summary":[{"type":"summary_text","text":"The graph has one risky seam."}]}}
+{"timestamp":"2026-09-01T10:00:05Z","type":"response_item","payload":{"type":"reasoning","id":"reasoning-encrypted","summary":[],"encrypted_content":"redacted"}}
+{"timestamp":"2026-09-01T10:00:06Z","type":"response_item","payload":{"type":"function_call","id":"fc-1","call_id":"call-spawn","name":"spawn_agent","namespace":"collaboration","arguments":"{\"task_name\":\"child-a\",\"message\":\"redacted\"}"}}
+{"timestamp":"2026-09-01T10:00:06Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"turn-root","item":{"type":"SubAgentActivity","id":"call-spawn","kind":"started","agent_thread_id":"child-thread","agent_path":"/root/child-a"}}}
+{"timestamp":"2026-09-01T10:00:06Z","type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"call-spawn","occurred_at_ms":1788256806000,"kind":"started","agent_thread_id":"child-thread","agent_path":"/root/child-a"}}
+{"timestamp":"2026-09-01T10:00:07Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-spawn","output":"{\"task_name\":\"/root/child-a\"}"}}
+{"timestamp":"2026-09-01T10:00:08Z","type":"response_item","payload":{"type":"custom_tool_call","id":"ctc-1","call_id":"call-ok","name":"exec","status":"completed","input":"{\"command\":\"cargo check\"}"}}
+{"timestamp":"2026-09-01T10:00:09Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-ok","output":[{"type":"input_text","text":"Script completed\nOutput:\nclean"}]}}
+{"timestamp":"2026-09-01T10:00:10Z","type":"response_item","payload":{"type":"custom_tool_call","id":"ctc-2","call_id":"call-fail","name":"exec","status":"completed","input":"{\"command\":\"cargo test\"}"}}
+{"timestamp":"2026-09-01T10:00:11Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-fail","output":[{"type":"input_text","text":"Script failed\nOutput:\none test failed"}]}}
+{"timestamp":"2026-09-01T10:00:12Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":40,"cache_write_input_tokens":0,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110}}}}
+{"timestamp":"2026-09-01T10:00:12Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":40,"cache_write_input_tokens":0,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110}}}}
+{"timestamp":"2026-09-01T10:00:13Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":180,"cached_input_tokens":60,"cache_write_input_tokens":0,"output_tokens":25,"reasoning_output_tokens":8,"total_tokens":205}}}}
+{"timestamp":"2026-09-01T10:00:14Z","type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"activity-complete","occurred_at_ms":1788256814000,"kind":"completed","agent_thread_id":"child-thread","agent_path":"/root/child-a"}}
+{"timestamp":"2026-09-01T10:00:14Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"SubAgentActivity","id":"activity-complete","kind":"completed","agent_thread_id":"child-thread","agent_path":"/root/child-a"}}}
+not json
+{"timestamp":"2026-09-01T10:00:15Z","type":"future_record","payload":{"type":"future_payload","anything":true}}

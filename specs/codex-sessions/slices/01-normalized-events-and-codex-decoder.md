@@ -1,5 +1,36 @@
 # Slice 01 — Normalized Events and Codex Decoder
 
+## Status
+
+Complete on `codex-slice1`. The completion checkpoint is the commit containing
+this status; its source hash is recorded in the integration handoff.
+
+Rust 1.88 evidence: 8 focused Codex decoder tests pass; the full suite passes
+with 191 library and 8 binary tests; `cargo check --no-default-features --lib`,
+rustdoc, formatting, and diff checks pass. Strict all-target/all-feature clippy
+still reaches two pre-existing warnings in `src/ui/panel.rs` and
+`src/state/session.rs`; allowing only those two lint classes leaves clippy
+clean. Child ownership, item de-duplication, current `final_answer`, tagged goal
+extraction, and array-valued tool outcomes were each proven by red/green
+falsification. Semantic tool category and per-scope usage revision assertions
+were also proven red before restoration.
+
+```yaml
+review:
+  pass_id: codex-sessions-01
+  risk: high
+  lane: subagent
+  effort_class: critical
+  session_id: null
+  initial_verdict: findings
+  recheck_count: 2
+```
+
+The directed recheck is clean. Integration must keep `event::{Provider,
+SessionKey}` as the sole provider/session identity; if Slice 02 is already
+present, remove its parallel catalog-owned identity types during integration.
+The next implementation pickup is Slice 03 on the integrated branch.
+
 ## Contract
 
 A stateful, portable decoder turns sanitized Codex JSONL into one provider-neutral event stream with deterministic de-duplication. It is independently testable and does not yet need to drive every production consumer.
@@ -45,4 +76,3 @@ Provisional tier: high. The risk is silent double-counting or false attribution.
 Implementer discretion is limited to internal module/file names and private DTO decomposition. Canonical sources, ownership behavior, event meaning, and defensive fallbacks are not delegated.
 
 Must stay green: existing parser/model characterization tests and the portable no-default-features build.
-

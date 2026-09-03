@@ -1,0 +1,6 @@
+{"timestamp":"2026-09-02T10:00:00Z","type":"session_meta","payload":{"id":"goal-thread","cwd":"/workspace/demo","cli_version":"0.152.1","source":"cli"}}
+{"timestamp":"2026-09-02T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"goal-turn"}}
+{"timestamp":"2026-09-02T10:00:01Z","type":"response_item","payload":{"type":"message","id":"ordinary-context","role":"user","content":[{"type":"input_text","text":"Injected context must not become a prompt."}]}}
+{"timestamp":"2026-09-02T10:00:01Z","type":"response_item","payload":{"type":"message","id":"legacy-goal-context","role":"user","content":[{"type":"input_text","text":"<codex_internal_context source=\"goal\">The objective is: this unsupported shape must not become a prompt.</codex_internal_context>"}]}}
+{"timestamp":"2026-09-02T10:00:02Z","type":"response_item","payload":{"type":"message","id":"goal-context","role":"user","content":[{"type":"input_text","text":"<codex_internal_context source=\"goal\"><objective>Finish the release checklist.</objective><status>active</status></codex_internal_context>"}]}}
+{"timestamp":"2026-09-02T10:00:03Z","type":"response_item","payload":{"type":"message","id":"goal-answer","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"The checklist is complete."}]}}

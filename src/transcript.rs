@@ -857,6 +857,48 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn claude_fixture_characterizes_the_adapter_contract_before_cutover() {
+        let entries: Vec<Entry> = include_str!("../tests/fixtures/claude/characterization.jsonl")
+            .lines()
+            .filter_map(parse_line)
+            .collect();
+
+        let prompts: Vec<&str> = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::User(user) if user.is_human_prompt() => user.prompt_text(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(prompts, ["Map the dependency graph."]);
+        assert_eq!(entries.iter().map(Entry::tool_use_count).sum::<usize>(), 2);
+        assert_eq!(entries.iter().map(Entry::spawn_count).sum::<usize>(), 1);
+        assert_eq!(
+            entries.iter().map(Entry::tool_failure_count).sum::<usize>(),
+            1
+        );
+
+        let assistant = entries.iter().find_map(|entry| match entry {
+            Entry::Assistant(assistant) => Some(assistant),
+            _ => None,
+        });
+        let message = assistant.and_then(|assistant| assistant.message.as_ref());
+        assert_eq!(
+            message.and_then(|message| message.model.as_deref()),
+            Some("claude-test")
+        );
+        assert_eq!(
+            message
+                .and_then(|message| message.usage.as_ref())
+                .and_then(|usage| usage.output_tokens),
+            Some(12)
+        );
+        assert!(
+            matches!(entries.last(), Some(Entry::AiTitle(title)) if title.title.as_deref() == Some("Dependency map"))
+        );
+    }
+
+    #[test]
     fn parse_task_notification_extracts_id_and_status() {
         let text = "<task-notification>\n<task-id>a725391d5b4367772</task-id>\n<output-file>/x.output</output-file>\n<status>stopped</status>\n<summary>No completion record</summary>\n</task-notification>";
         let tn = parse_task_notification(text).expect("is a task-notification");
