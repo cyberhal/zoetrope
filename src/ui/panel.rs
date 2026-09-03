@@ -96,7 +96,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App, agent_id: &str) {
             let label = if *detail_follow {
                 " j/k ↕ tail ".to_string()
             } else {
-                format!(" j/k ↕ {}/{} ", detail_scroll, n)
+                format!(" j/k ↕ {detail_scroll}/{n} ")
             };
             block = block.title_bottom(
                 Line::from(label)
