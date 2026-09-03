@@ -89,8 +89,6 @@ pub struct SessionModel {
     /// session's spine. Tool calls and spawns attribute to a prompt era via
     /// [`Self::prompt_for_ts`] (timestamp-derived, order-independent).
     pub prompts: Vec<PromptInfo>,
-    #[cfg(test)]
-    test_claude_decoders: HashMap<crate::tailer::Source, crate::formats::claude::ClaudeDecoder>,
 }
 
 /// A notable timeline event for the scrubber's log line: a prompt (era
@@ -349,13 +347,7 @@ impl SessionModel {
     pub fn new(session: SessionKey) -> Self {
         let mut agents = BTreeMap::new();
         let mut root = AgentInfo::new(AgentKind::Main);
-        root.agent_type = Some(
-            match session.provider {
-                crate::event::Provider::Claude => "claude",
-                crate::event::Provider::Codex => "codex",
-            }
-            .to_owned(),
-        );
+        root.agent_type = Some(session.provider.label().to_owned());
         agents.insert(MAIN_ID.to_string(), root);
         SessionModel {
             session,
@@ -372,8 +364,6 @@ impl SessionModel {
             child_spawn_references: BTreeMap::new(),
             spawn_link_strength: HashMap::new(),
             prompts: Vec::new(),
-            #[cfg(test)]
-            test_claude_decoders: HashMap::new(),
         }
     }
 
@@ -506,66 +496,6 @@ impl SessionModel {
             self.resolve_spawn_status(&actor);
         }
         structural
-    }
-
-    #[cfg(test)]
-    pub(crate) fn apply_update(&mut self, update: &crate::tailer::Update) -> bool {
-        use crate::formats::claude::{ClaudeDecoder, ClaudeFile, decode_subagent_metadata};
-        use crate::tailer::{Source, Update};
-        let events = match update {
-            Update::Event(event) => vec![event.clone()],
-            Update::SubagentMeta {
-                agent_id,
-                workflow,
-                meta,
-            } => {
-                let text = serde_json::json!({
-                    "agentType": meta.agent_type,
-                    "description": meta.description,
-                    "toolUseId": meta.tool_use_id,
-                    "stoppedByUser": meta.stopped_by_user,
-                })
-                .to_string();
-                decode_subagent_metadata(&self.session, agent_id, workflow.as_deref(), &text)
-            }
-            Update::Entry { source, entry } => {
-                let session = self.session.clone();
-                let decoder = self
-                    .test_claude_decoders
-                    .entry(source.clone())
-                    .or_insert_with(|| {
-                        let file = match source {
-                            Source::Main => ClaudeFile::Root,
-                            Source::Sub(agent_id) => ClaudeFile::Subagent {
-                                agent_id: agent_id.clone(),
-                                workflow: None,
-                            },
-                            Source::Journal(workflow) => ClaudeFile::WorkflowJournal {
-                                workflow: workflow.clone(),
-                            },
-                        };
-                        ClaudeDecoder::new(session, file)
-                    });
-                decoder.decode_test_entry(entry.clone())
-            }
-        };
-        events
-            .iter()
-            .fold(false, |changed, event| self.apply_event(event) || changed)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn apply_meta(
-        &mut self,
-        agent_id: &str,
-        workflow: Option<&str>,
-        meta: &crate::transcript::SubagentMeta,
-    ) -> bool {
-        self.apply_update(&crate::tailer::Update::SubagentMeta {
-            agent_id: agent_id.to_owned(),
-            workflow: workflow.map(str::to_owned),
-            meta: meta.clone(),
-        })
     }
 
     fn logical_actor(&self, actor: &ActorId) -> String {
@@ -1301,86 +1231,6 @@ fn lifecycle_rank(status: AgentStatus) -> u8 {
     }
 }
 
-/// Derive a short one-line summary from a tool_use input, if a natural field
-/// exists for the tool. Defensive: any shape that doesn't match yields `None`.
-#[cfg(test)]
-fn summarize_tool(name: &str, input: &serde_json::Value, cwd: Option<&str>) -> Option<String> {
-    let pick = |key: &str| {
-        input
-            .get(key)
-            .and_then(|v| v.as_str())
-            .map(truncate_summary)
-    };
-    // File paths: show project-relative (`src/main.rs`) instead of the absolute
-    // path, and keep the basename if it still needs truncating.
-    let pick_path = |key: &str| {
-        input
-            .get(key)
-            .and_then(|v| v.as_str())
-            .map(|p| short_path(p, cwd))
-    };
-    match name {
-        "Bash" => pick("command").or_else(|| pick("description")),
-        "Read" | "Write" | "Edit" => pick_path("file_path").or_else(|| pick_path("path")),
-        n if crate::transcript::is_spawn_tool(n) => {
-            // Prefer the typed view for description/subagent_type.
-            let typed: crate::transcript::AgentToolInput =
-                serde_json::from_value(input.clone()).unwrap_or_default();
-            typed
-                .description
-                .or(typed.subagent_type)
-                .map(|s| truncate_summary(&s))
-        }
-        "WebFetch" => pick("url"),
-        "ToolSearch" => pick("query"),
-        _ => pick("description").or_else(|| pick("query")),
-    }
-}
-
-/// Upper bound on a stored tool summary. Generous on purpose: the detail panel
-/// truncates to its (often wide) width at render time, so this only caps
-/// pathological inputs. The node cards don't render summaries, so it is NOT a
-/// card-width constraint — capping tighter here just starved the panel.
-#[cfg(test)]
-const SUMMARY_MAX: usize = 200;
-
-/// Collapse whitespace and truncate a summary to [`SUMMARY_MAX`].
-#[cfg(test)]
-fn truncate_summary(s: &str) -> String {
-    let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    const MAX: usize = SUMMARY_MAX;
-    if flat.chars().count() > MAX {
-        let truncated: String = flat.chars().take(MAX - 1).collect();
-        format!("{truncated}…")
-    } else {
-        flat
-    }
-}
-
-/// A file path, made readable for the panel: relative to `cwd` when it lives
-/// under the project root, and truncated keeping the BASENAME (not the root) if
-/// it's still long — `…/state/timeline.rs`, never `/Users/.../src/sta…`.
-#[cfg(test)]
-fn short_path(path: &str, cwd: Option<&str>) -> String {
-    let rel = cwd
-        .and_then(|c| path.strip_prefix(c).map(|r| (c, r)))
-        // Only a match at a path-component boundary counts: without this a
-        // SIBLING dir sharing the cwd as a string prefix is mangled
-        // (cwd `…/zoetrope` + path `…/zoetrope-web/src/app.rs` → `-web/src/app.rs`).
-        .filter(|(c, r)| r.starts_with('/') || c.ends_with('/'))
-        .map(|(_, r)| r.trim_start_matches('/'))
-        .filter(|r| !r.is_empty())
-        .unwrap_or(path);
-    const MAX: usize = SUMMARY_MAX;
-    let n = rel.chars().count();
-    if n <= MAX {
-        return rel.to_string();
-    }
-    // Keep the tail (basename + nearest dirs) with a leading ellipsis.
-    let tail: String = rel.chars().skip(n - (MAX - 1)).collect();
-    format!("…{tail}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1388,13 +1238,40 @@ mod tests {
         AgentDescriptor, AgentRole, EventTime, Provider, SessionEvent, SessionKey, SpawnProvenance,
         ToolCategory, ToolFinish, ToolOutcome, ToolStart, UsageObservation,
     };
-    use crate::tailer::{Source, Update};
+    use crate::formats::claude::ClaudeFile;
     use crate::transcript::{Entry, SubagentMeta, parse_line};
 
     /// Build an `Entry` from a JSONL line, panicking in tests only if the
     /// fixture itself is malformed (parser returns `None`).
     fn entry(line: &str) -> Entry {
         parse_line(line).expect("test fixture must parse")
+    }
+
+    fn apply_events(model: &mut SessionModel, events: Vec<SessionEvent>) -> bool {
+        events
+            .iter()
+            .fold(false, |changed, event| model.apply_event(event) || changed)
+    }
+
+    fn apply_entry(model: &mut SessionModel, file: ClaudeFile, entry: Entry) -> bool {
+        let session = model.session.clone();
+        apply_events(
+            model,
+            crate::test_support::claude_events(&session, file, entry),
+        )
+    }
+
+    fn apply_meta(
+        model: &mut SessionModel,
+        agent_id: &str,
+        workflow: Option<&str>,
+        meta: &SubagentMeta,
+    ) -> bool {
+        let session = model.session.clone();
+        apply_events(
+            model,
+            crate::test_support::metadata_events(&session, agent_id, workflow, meta),
+        )
     }
 
     fn neutral(kind: EventKind) -> SessionEvent {
@@ -1894,23 +1771,35 @@ mod tests {
 
     #[test]
     fn subagent_liveness_is_time_derived_running_then_done() {
-        let sub_asst = |ts: &str| Update::Entry {
-            source: Source::Sub("sub".into()),
-            entry: entry(&format!(
-                r#"{{"type":"assistant","uuid":"u","parentUuid":null,"timestamp":"{ts}","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"b1","name":"Bash","input":{{}}}}]}}}}"#
-            )),
+        let sub_asst = |ts: &str| {
+            crate::test_support::claude_events(
+                &SessionKey::from("s"),
+                ClaudeFile::Subagent {
+                    agent_id: "sub".into(),
+                    workflow: None,
+                },
+                entry(&format!(
+                    r#"{{"type":"assistant","uuid":"u","parentUuid":null,"timestamp":"{ts}","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"b1","name":"Bash","input":{{}}}}]}}}}"#
+                )),
+            )
         };
-        let sub_result = |ts: &str| Update::Entry {
-            source: Source::Sub("sub".into()),
-            entry: entry(&format!(
-                r#"{{"type":"user","uuid":"r","parentUuid":null,"timestamp":"{ts}","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"b1"}}]}}}}"#
-            )),
+        let sub_result = |ts: &str| {
+            crate::test_support::claude_events(
+                &SessionKey::from("s"),
+                ClaudeFile::Subagent {
+                    agent_id: "sub".into(),
+                    workflow: None,
+                },
+                entry(&format!(
+                    r#"{{"type":"user","uuid":"r","parentUuid":null,"timestamp":"{ts}","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"b1"}}]}}}}"#
+                )),
+            )
         };
         let mut m = SessionModel::new("s".into());
-        m.apply_update(&sub_asst("2026-06-07T13:00:00.000Z"));
+        apply_events(&mut m, sub_asst("2026-06-07T13:00:00.000Z"));
         // Resolve the tool so liveness is driven by quiet-time, not the pending
         // tool (an unresolved tool holds it Running — see the next test).
-        m.apply_update(&sub_result("2026-06-07T13:00:01.000Z"));
+        apply_events(&mut m, sub_result("2026-06-07T13:00:01.000Z"));
         assert_eq!(m.agent("sub").unwrap().status, AgentStatus::Running);
 
         // Reference just after its activity → still Running (within the window).
@@ -1923,7 +1812,7 @@ mod tests {
         assert_eq!(m.agent("sub").unwrap().status, AgentStatus::Done);
 
         // Fresh activity revives it — liveness is derived and reversible.
-        m.apply_update(&sub_asst("2026-06-07T13:30:05.000Z"));
+        apply_events(&mut m, sub_asst("2026-06-07T13:30:05.000Z"));
         m.recompute_liveness(Some("2026-06-07T13:30:06.000Z".parse().unwrap()));
         assert_eq!(m.agent("sub").unwrap().status, AgentStatus::Running);
     }
@@ -1934,20 +1823,32 @@ mod tests {
         // minutes, but its pending tool_call is direct proof it's still working.
         // It must NOT settle to Done mid-tool (which dropped its in-flight chip
         // and hid the tool's eventual result — a real error even went unshown).
-        let sub_asst = |ts: &str| Update::Entry {
-            source: Source::Sub("sub".into()),
-            entry: entry(&format!(
-                r#"{{"type":"assistant","uuid":"u","parentUuid":null,"timestamp":"{ts}","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"b1","name":"Bash","input":{{}}}}]}}}}"#
-            )),
+        let sub_asst = |ts: &str| {
+            crate::test_support::claude_events(
+                &SessionKey::from("s"),
+                ClaudeFile::Subagent {
+                    agent_id: "sub".into(),
+                    workflow: None,
+                },
+                entry(&format!(
+                    r#"{{"type":"assistant","uuid":"u","parentUuid":null,"timestamp":"{ts}","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"b1","name":"Bash","input":{{}}}}]}}}}"#
+                )),
+            )
         };
-        let sub_result = |ts: &str| Update::Entry {
-            source: Source::Sub("sub".into()),
-            entry: entry(&format!(
-                r#"{{"type":"user","uuid":"r","parentUuid":null,"timestamp":"{ts}","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"b1"}}]}}}}"#
-            )),
+        let sub_result = |ts: &str| {
+            crate::test_support::claude_events(
+                &SessionKey::from("s"),
+                ClaudeFile::Subagent {
+                    agent_id: "sub".into(),
+                    workflow: None,
+                },
+                entry(&format!(
+                    r#"{{"type":"user","uuid":"r","parentUuid":null,"timestamp":"{ts}","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"b1"}}]}}}}"#
+                )),
+            )
         };
         let mut m = SessionModel::new("s".into());
-        m.apply_update(&sub_asst("2026-06-07T13:00:00.000Z"));
+        apply_events(&mut m, sub_asst("2026-06-07T13:00:00.000Z"));
 
         // Far past the idle window, but the Bash is still pending → stays Running.
         m.recompute_liveness(Some("2026-06-07T13:30:00.000Z".parse().unwrap()));
@@ -1958,58 +1859,74 @@ mod tests {
         );
 
         // The tool resolves; now genuine quiet settles it to Done.
-        m.apply_update(&sub_result("2026-06-07T13:30:01.000Z"));
+        apply_events(&mut m, sub_result("2026-06-07T13:30:01.000Z"));
         m.recompute_liveness(Some("2026-06-07T14:00:00.000Z".parse().unwrap()));
         assert_eq!(m.agent("sub").unwrap().status, AgentStatus::Done);
     }
 
     #[test]
     fn a_parallel_subagent_stays_running_past_its_immediate_spawn_ack() {
-        let asst = |src: Source, id: &str, name: &str, ts: &str| Update::Entry {
-            source: src,
-            entry: entry(&format!(
-                r#"{{"type":"assistant","uuid":"u","parentUuid":null,"timestamp":"{ts}","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"{id}","name":"{name}","input":{{}}}}]}}}}"#
-            )),
+        let asst = |src: ClaudeFile, id: &str, name: &str, ts: &str| {
+            crate::test_support::claude_events(
+                &SessionKey::from("s"),
+                src,
+                entry(&format!(
+                    r#"{{"type":"assistant","uuid":"u","parentUuid":null,"timestamp":"{ts}","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"{id}","name":"{name}","input":{{}}}}]}}}}"#
+                )),
+            )
         };
-        let result = |src: Source, tid: &str, ts: &str| Update::Entry {
-            source: src,
-            entry: entry(&format!(
-                r#"{{"type":"user","uuid":"r","parentUuid":null,"timestamp":"{ts}","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{tid}"}}]}}}}"#
-            )),
+        let result = |src: ClaudeFile, tid: &str, ts: &str| {
+            crate::test_support::claude_events(
+                &SessionKey::from("s"),
+                src,
+                entry(&format!(
+                    r#"{{"type":"user","uuid":"r","parentUuid":null,"timestamp":"{ts}","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{tid}"}}]}}}}"#
+                )),
+            )
         };
-        let meta = |agent: &str, tid: &str| Update::SubagentMeta {
-            agent_id: agent.into(),
-            workflow: None,
-            meta: crate::transcript::SubagentMeta {
-                agent_type: Some("guide".into()),
-                description: None,
-                tool_use_id: Some(tid.into()),
-                stopped_by_user: None,
-            },
+        let meta = |agent: &str, tid: &str| {
+            crate::test_support::metadata_events(
+                &SessionKey::from("s"),
+                agent,
+                None,
+                &crate::transcript::SubagentMeta {
+                    agent_type: Some("guide".into()),
+                    description: None,
+                    tool_use_id: Some(tid.into()),
+                    stopped_by_user: None,
+                },
+            )
         };
 
         let mut m = SessionModel::new("s".into());
         // Main spawns the agent; its `Agent` result is an IMMEDIATE ack (5ms).
-        m.apply_update(&asst(
-            Source::Main,
-            "ag",
-            "Agent",
-            "2026-06-05T10:00:00.000Z",
-        ));
-        m.apply_update(&result(Source::Main, "ag", "2026-06-05T10:00:00.005Z"));
-        m.apply_update(&meta("sub", "ag"));
+        apply_events(
+            &mut m,
+            asst(ClaudeFile::Root, "ag", "Agent", "2026-06-05T10:00:00.000Z"),
+        );
+        apply_events(
+            &mut m,
+            result(ClaudeFile::Root, "ag", "2026-06-05T10:00:00.005Z"),
+        );
+        apply_events(&mut m, meta("sub", "ag"));
         // No own activity yet → the ack is its only signal → reads Done.
         assert_eq!(m.agent("sub").unwrap().status, AgentStatus::Done);
 
         // Then the subagent works for minutes: its own activity supersedes the
         // immediate ack, so it must read Running (else its chips are pruned as
         // orphans of a "finished" agent — the flicker bug).
-        m.apply_update(&asst(
-            Source::Sub("sub".into()),
-            "b1",
-            "Bash",
-            "2026-06-05T10:03:00.000Z",
-        ));
+        apply_events(
+            &mut m,
+            asst(
+                ClaudeFile::Subagent {
+                    agent_id: "sub".into(),
+                    workflow: None,
+                },
+                "b1",
+                "Bash",
+                "2026-06-05T10:03:00.000Z",
+            ),
+        );
         assert_eq!(m.agent("sub").unwrap().status, AgentStatus::Running);
 
         // The recording ends → it settles back to Done.
@@ -2019,29 +1936,36 @@ mod tests {
 
     #[test]
     fn a_task_notification_marks_the_agent_stopped_and_is_not_a_prompt() {
-        let sub_asst = |ts: &str| Update::Entry {
-            source: Source::Sub("sub".into()),
-            entry: entry(&format!(
-                r#"{{"type":"assistant","uuid":"u","parentUuid":null,"timestamp":"{ts}","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"b","name":"Bash","input":{{}}}}]}}}}"#
-            )),
+        let sub_asst = |ts: &str| {
+            crate::test_support::claude_events(
+                &SessionKey::from("s"),
+                ClaudeFile::Subagent {
+                    agent_id: "sub".into(),
+                    workflow: None,
+                },
+                entry(&format!(
+                    r#"{{"type":"assistant","uuid":"u","parentUuid":null,"timestamp":"{ts}","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"b","name":"Bash","input":{{}}}}]}}}}"#
+                )),
+            )
         };
-        let notif = Update::Entry {
-            source: Source::Main,
-            entry: entry(
+        let notif = crate::test_support::claude_events(
+            &SessionKey::from("s"),
+            ClaudeFile::Root,
+            entry(
                 r#"{"type":"user","uuid":"n","parentUuid":null,"timestamp":"2026-06-05T10:05:00.000Z","message":{"role":"user","content":"<task-notification>\n<task-id>sub</task-id>\n<status>stopped</status>\n<summary>x</summary>\n</task-notification>"}}"#,
             ),
-        };
+        );
 
         let mut m = SessionModel::new("s".into());
-        m.apply_update(&sub_asst("2026-06-05T10:00:00.000Z"));
+        apply_events(&mut m, sub_asst("2026-06-05T10:00:00.000Z"));
         assert_eq!(m.agent("sub").unwrap().status, AgentStatus::Running);
 
         // The `<task-notification>` is the authoritative terminal report.
-        m.apply_update(&notif);
+        apply_events(&mut m, notif);
         assert_eq!(m.agent("sub").unwrap().status, AgentStatus::Stopped);
 
         // Terminal — even later activity (an out-of-order fold) can't revive it.
-        m.apply_update(&sub_asst("2026-06-05T10:06:00.000Z"));
+        apply_events(&mut m, sub_asst("2026-06-05T10:06:00.000Z"));
         assert_eq!(m.agent("sub").unwrap().status, AgentStatus::Stopped);
 
         // And it is NOT a user prompt — the era spine stays clean.
@@ -2064,13 +1988,17 @@ mod tests {
             tool_use_id: Some("ag".into()),
             stopped_by_user: Some(true),
         };
-        m.apply_meta("sub", None, &meta);
-        m.apply_update(&Update::Entry {
-            source: Source::Sub("sub".into()),
-            entry: entry(
+        apply_meta(&mut m, "sub", None, &meta);
+        apply_entry(
+            &mut m,
+            ClaudeFile::Subagent {
+                agent_id: "sub".into(),
+                workflow: None,
+            },
+            entry(
                 r#"{"type":"assistant","uuid":"u","parentUuid":null,"timestamp":"2026-06-05T10:00:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"b","name":"Bash","input":{}}]}}"#,
             ),
-        });
+        );
         assert_eq!(
             m.agent("sub").unwrap().status,
             AgentStatus::Running,
@@ -2078,14 +2006,11 @@ mod tests {
         );
     }
 
-    fn assistant_tool_use(source: Source, tool_id: &str, name: &str) -> Update {
+    fn assistant_tool_use(source: ClaudeFile, tool_id: &str, name: &str) -> Vec<SessionEvent> {
         let line = format!(
-            r#"{{"type":"assistant","uuid":"u1","parentUuid":null,"timestamp":"2026-06-05T13:51:15.151Z","message":{{"role":"assistant","model":"claude-opus-4-8","content":[{{"type":"tool_use","id":"{tool_id}","name":"{name}","input":{{"command":"ls -la"}}}}],"usage":{{"output_tokens":42}}}}}}"#
+            r#"{{"type":"assistant","uuid":"{tool_id}","parentUuid":null,"timestamp":"2026-06-05T13:51:15.151Z","message":{{"role":"assistant","model":"claude-opus-4-8","content":[{{"type":"tool_use","id":"{tool_id}","name":"{name}","input":{{"command":"ls -la"}}}}],"usage":{{"output_tokens":42}}}}}}"#
         );
-        Update::Entry {
-            source,
-            entry: entry(&line),
-        }
+        crate::test_support::claude_events(&SessionKey::from("s"), source, entry(&line))
     }
 
     /// Shuffle invariance: the model's final state must be a pure function of
@@ -2093,94 +2018,71 @@ mod tests {
     /// (within-source order is preserved — that is what reality guarantees:
     /// each file is tailed in file order, but files interleave arbitrarily).
     ///
-    #[test]
-    fn summarize_tool_relativizes_paths() {
-        // File paths show project-relative, not absolute.
-        let edit = serde_json::json!({ "file_path": "/proj/src/main.rs" });
-        assert_eq!(
-            summarize_tool("Edit", &edit, Some("/proj")).as_deref(),
-            Some("src/main.rs")
-        );
-        // A path outside the cwd is kept as-is.
-        let outside = serde_json::json!({ "file_path": "/other/x.rs" });
-        assert_eq!(
-            summarize_tool("Read", &outside, Some("/proj")).as_deref(),
-            Some("/other/x.rs")
-        );
-        // Non-path tools are unaffected (command kept, head-truncated elsewhere).
-        let bash = serde_json::json!({ "command": "cargo test" });
-        assert_eq!(
-            summarize_tool("Bash", &bash, Some("/proj")).as_deref(),
-            Some("cargo test")
-        );
-    }
-
-    #[test]
-    fn short_path_strips_cwd_only_at_a_component_boundary() {
-        assert_eq!(
-            short_path(
-                "/Users/me/projects/zoetrope/src/a.rs",
-                Some("/Users/me/projects/zoetrope")
-            ),
-            "src/a.rs"
-        );
-        // A SIBLING dir sharing the cwd as a string prefix must NOT be mangled
-        // into a fake relative path ("-web/src/a.rs").
-        assert_eq!(
-            short_path(
-                "/Users/me/projects/zoetrope-web/src/a.rs",
-                Some("/Users/me/projects/zoetrope")
-            ),
-            "/Users/me/projects/zoetrope-web/src/a.rs"
-        );
-        assert_eq!(short_path("/project/x.rs", Some("/proj")), "/project/x.rs");
-        // A trailing-slash cwd still relativizes.
-        assert_eq!(short_path("/proj/x.rs", Some("/proj/")), "x.rs");
-        // cwd == path falls back to the absolute path (not an empty string).
-        assert_eq!(short_path("/proj", Some("/proj")), "/proj");
-    }
-
     /// This is the enforcement test for the order-independence invariant; it
     /// would have caught the lost-completion and journal-before-agent bugs.
     #[test]
     fn final_state_is_arrival_order_invariant() {
         // Per-source streams (internal order preserved by the interleaver).
-        fn streams() -> Vec<Vec<Update>> {
-            let meta = |agent_id: &str, wf: Option<&str>, tid: Option<&str>| Update::SubagentMeta {
-                agent_id: agent_id.into(),
-                workflow: wf.map(String::from),
-                meta: crate::transcript::SubagentMeta {
-                    agent_type: Some("guide".into()),
-                    description: None,
-                    tool_use_id: tid.map(String::from),
-                    stopped_by_user: None,
-                },
+        fn streams() -> Vec<Vec<SessionEvent>> {
+            let meta = |agent_id: &str, wf: Option<&str>, tid: Option<&str>| {
+                crate::test_support::metadata_events(
+                    &SessionKey::from("s"),
+                    agent_id,
+                    wf,
+                    &crate::transcript::SubagentMeta {
+                        agent_type: Some("guide".into()),
+                        description: None,
+                        tool_use_id: tid.map(String::from),
+                        stopped_by_user: None,
+                    },
+                )
             };
-            let journal_result = |agent_id: &str| Update::Entry {
-                source: Source::Journal("wf_1".into()),
-                entry: entry(&format!(
-                    r#"{{"type":"result","key":"v2:k","agentId":"{agent_id}","result":{{"ok":true}}}}"#
-                )),
+            let journal_result = |agent_id: &str| {
+                crate::test_support::claude_events(
+                    &SessionKey::from("s"),
+                    ClaudeFile::WorkflowJournal {
+                        workflow: "wf_1".into(),
+                    },
+                    entry(&format!(
+                        r#"{{"type":"result","key":"v2:k","agentId":"{agent_id}","result":{{"ok":true}}}}"#
+                    )),
+                )
             };
             vec![
                 // Main transcript: spawn two agents, one completes ok, one err.
-                vec![
-                    assistant_tool_use(Source::Main, "ag_ok", "Agent"),
-                    assistant_tool_use(Source::Main, "ag_err", "Agent"),
-                    tool_result(Source::Main, "ag_ok", false),
-                    tool_result(Source::Main, "ag_err", true),
-                ],
+                [
+                    assistant_tool_use(ClaudeFile::Root, "ag_ok", "Agent"),
+                    assistant_tool_use(ClaudeFile::Root, "ag_err", "Agent"),
+                    tool_result(ClaudeFile::Root, "ag_ok", false),
+                    tool_result(ClaudeFile::Root, "ag_err", true),
+                ]
+                .concat(),
                 // Each meta is its own arrival (dir scans are independent).
-                vec![meta("sub_ok", None, Some("ag_ok"))],
-                vec![meta("sub_err", None, Some("ag_err"))],
-                vec![meta("wfsub", Some("wf_1"), None)],
+                meta("sub_ok", None, Some("ag_ok")),
+                meta("sub_err", None, Some("ag_err")),
+                meta("wfsub", Some("wf_1"), None),
                 // The workflow subagent's own activity.
-                vec![
-                    assistant_tool_use(Source::Sub("wfsub".into()), "w1", "Bash"),
-                    tool_result(Source::Sub("wfsub".into()), "w1", false),
-                ],
+                [
+                    assistant_tool_use(
+                        ClaudeFile::Subagent {
+                            agent_id: "wfsub".into(),
+                            workflow: None,
+                        },
+                        "w1",
+                        "Bash",
+                    ),
+                    tool_result(
+                        ClaudeFile::Subagent {
+                            agent_id: "wfsub".into(),
+                            workflow: None,
+                        },
+                        "w1",
+                        false,
+                    ),
+                ]
+                .concat(),
                 // The journal completing it.
-                vec![journal_result("wfsub")],
+                journal_result("wfsub"),
             ]
         }
 
@@ -2223,8 +2125,8 @@ mod tests {
                     .filter(|&i| !queues[i].is_empty())
                     .collect();
                 let pick = nonempty[(seed >> 33) as usize % nonempty.len()];
-                let update = queues[pick].remove(0);
-                m.apply_update(&update);
+                let event = queues[pick].remove(0);
+                m.apply_event(&event);
             }
             m.recompute_workflow_status();
             m
@@ -2264,20 +2166,23 @@ mod tests {
         // Children are discovered incrementally and unordered: a group that
         // rolled up to Done from its first (already-finished) child must
         // revert to Running when a still-running sibling is discovered.
-        let mut m = SessionModel::new("s1".into());
+        let mut m = SessionModel::new("s".into());
 
         // Child A arrives already completed (journal result first).
-        m.apply_update(&Update::Entry {
-            source: Source::Journal("wf_1".into()),
-            entry: entry(r#"{"type":"result","key":"v2:k","agentId":"childA","result":{}}"#),
-        });
+        apply_entry(
+            &mut m,
+            ClaudeFile::WorkflowJournal {
+                workflow: "wf_1".into(),
+            },
+            entry(r#"{"type":"result","key":"v2:k","agentId":"childA","result":{}}"#),
+        );
         let meta_a = crate::transcript::SubagentMeta {
             agent_type: Some("workflow-subagent".into()),
             description: None,
             tool_use_id: None,
             stopped_by_user: None,
         };
-        m.apply_meta("childA", Some("wf_1"), &meta_a);
+        apply_meta(&mut m, "childA", Some("wf_1"), &meta_a);
         m.recompute_workflow_status();
         assert_eq!(m.agent("wf_1").unwrap().status, AgentStatus::Done);
 
@@ -2288,7 +2193,7 @@ mod tests {
             tool_use_id: None,
             stopped_by_user: None,
         };
-        m.apply_meta("childB", Some("wf_1"), &meta_b);
+        apply_meta(&mut m, "childB", Some("wf_1"), &meta_b);
         m.recompute_workflow_status();
         assert_eq!(
             m.agent("wf_1").unwrap().status,
@@ -2299,24 +2204,21 @@ mod tests {
 
     #[test]
     fn token_sum_saturates_instead_of_overflowing() {
-        let mut m = SessionModel::new("s1".into());
+        let mut m = SessionModel::new("s".into());
         // Two turns with distinct requestIds, each claiming u64::MAX tokens.
         for (req, uid) in [("r1", "u1"), ("r2", "u2")] {
             let line = format!(
                 r#"{{"type":"assistant","uuid":"{uid}","parentUuid":null,"requestId":"{req}","message":{{"role":"assistant","content":[],"usage":{{"output_tokens":{}}}}}}}"#,
                 u64::MAX
             );
-            m.apply_update(&Update::Entry {
-                source: Source::Main,
-                entry: entry(&line),
-            });
+            apply_entry(&mut m, ClaudeFile::Root, entry(&line));
         }
         assert_eq!(m.agent(MAIN_ID).unwrap().output_tokens, u64::MAX);
     }
 
     #[test]
     fn fork_liveness_is_activity_derived() {
-        let mut m = SessionModel::new("s1".into());
+        let mut m = SessionModel::new("s".into());
         // A fork sidechain: agentType "fork", no toolUseId, no journal.
         let meta = crate::transcript::SubagentMeta {
             agent_type: Some("fork".into()),
@@ -2324,37 +2226,46 @@ mod tests {
             tool_use_id: None,
             stopped_by_user: None,
         };
-        m.apply_meta("ayess-123", None, &meta);
+        apply_meta(&mut m, "ayess-123", None, &meta);
 
         // The fork acts at 13:00.
-        m.apply_update(&Update::Entry {
-            source: Source::Sub("ayess-123".into()),
-            entry: entry(
+        apply_entry(
+            &mut m,
+            ClaudeFile::Subagent {
+                agent_id: "ayess-123".into(),
+                workflow: None,
+            },
+            entry(
                 r#"{"type":"assistant","uuid":"f1","parentUuid":null,"timestamp":"2026-06-07T13:00:00.000Z","message":{"role":"assistant","content":[]}}"#,
             ),
-        });
+        );
         m.recompute_liveness(None);
         assert_eq!(m.agent("ayess-123").unwrap().status, AgentStatus::Running);
 
         // The session moves on without it (main activity 3.5 min later):
         // the silent fork is shown done.
-        m.apply_update(&Update::Entry {
-            source: Source::Main,
-            entry: entry(
+        apply_entry(
+            &mut m,
+            ClaudeFile::Root,
+            entry(
                 r#"{"type":"user","uuid":"u9","parentUuid":null,"origin":{"kind":"human"},"timestamp":"2026-06-07T13:03:30.000Z","message":{"role":"user","content":"hi"}}"#,
             ),
-        });
+        );
         m.recompute_liveness(None);
         assert_eq!(m.agent("ayess-123").unwrap().status, AgentStatus::Idle);
 
         // The user returns to the fork (a USER entry — exercises the
         // owner-touch fix): it resurrects.
-        m.apply_update(&Update::Entry {
-            source: Source::Sub("ayess-123".into()),
-            entry: entry(
+        apply_entry(
+            &mut m,
+            ClaudeFile::Subagent {
+                agent_id: "ayess-123".into(),
+                workflow: None,
+            },
+            entry(
                 r#"{"type":"user","uuid":"f2","parentUuid":"f1","timestamp":"2026-06-07T13:04:00.000Z","message":{"role":"user","content":"more"}}"#,
             ),
-        });
+        );
         m.recompute_liveness(None);
         assert_eq!(m.agent("ayess-123").unwrap().status, AgentStatus::Running);
 
@@ -2369,7 +2280,7 @@ mod tests {
             tool_use_id: Some("t1".into()),
             stopped_by_user: None,
         };
-        m.apply_meta("sub1", None, &spawned);
+        apply_meta(&mut m, "sub1", None, &spawned);
         m.recompute_liveness(Some("2026-06-07T14:00:00.000Z".parse().unwrap()));
         assert_eq!(
             m.agent("sub1").unwrap().status,
@@ -2380,25 +2291,40 @@ mod tests {
 
     #[test]
     fn prompt_log_and_era_attribution() {
-        let mut m = SessionModel::new("s1".into());
-        let prompt = |uid: &str, ts: &str, text: &str| Update::Entry {
-            source: Source::Main,
-            entry: entry(&format!(
-                r#"{{"type":"user","uuid":"{uid}","parentUuid":null,"origin":{{"kind":"human"}},"timestamp":"{ts}","message":{{"role":"user","content":"{text}"}}}}"#
-            )),
+        let mut m = SessionModel::new("s".into());
+        let prompt = |uid: &str, ts: &str, text: &str| {
+            crate::test_support::claude_events(
+                &SessionKey::from("s"),
+                ClaudeFile::Root,
+                entry(&format!(
+                    r#"{{"type":"user","uuid":"{uid}","parentUuid":null,"origin":{{"kind":"human"}},"timestamp":"{ts}","message":{{"role":"user","content":"{text}"}}}}"#
+                )),
+            )
         };
-        m.apply_update(&prompt("p1", "2026-06-07T10:00:00.000Z", "first task"));
-        m.apply_update(&prompt("p2", "2026-06-07T11:00:00.000Z", "second task"));
+        apply_events(
+            &mut m,
+            prompt("p1", "2026-06-07T10:00:00.000Z", "first task"),
+        );
+        apply_events(
+            &mut m,
+            prompt("p2", "2026-06-07T11:00:00.000Z", "second task"),
+        );
         assert_eq!(m.prompts.len(), 2);
         assert_eq!(m.prompts[0].excerpt, "first task");
 
         // Idempotent: re-applying the same entry doesn't duplicate.
-        m.apply_update(&prompt("p2", "2026-06-07T11:00:00.000Z", "second task"));
+        apply_events(
+            &mut m,
+            prompt("p2", "2026-06-07T11:00:00.000Z", "second task"),
+        );
         assert_eq!(m.prompts.len(), 2);
 
         // Order-independent: re-applying an EARLIER (non-trailing) entry is still
         // a dup — the facts layer must hold under out-of-order replay.
-        m.apply_update(&prompt("p1", "2026-06-07T10:00:00.000Z", "first task"));
+        apply_events(
+            &mut m,
+            prompt("p1", "2026-06-07T10:00:00.000Z", "first task"),
+        );
         assert_eq!(
             m.prompts.len(),
             2,
@@ -2416,29 +2342,31 @@ mod tests {
 
     #[test]
     fn provenance_links_spawn_to_prompt_and_reasoning() {
-        let mut m = SessionModel::new("s1".into());
+        let mut m = SessionModel::new("s".into());
 
         // The human asks for something.
-        m.apply_update(&Update::Entry {
-            source: Source::Main,
-            entry: entry(
+        apply_entry(
+            &mut m,
+            ClaudeFile::Root,
+            entry(
                 r#"{"type":"user","uuid":"u1","parentUuid":null,"origin":{"kind":"human"},"timestamp":"2026-06-07T10:00:00.000Z","message":{"role":"user","content":"please research the flag handling"}}"#,
             ),
-        });
+        );
         // The assistant explains, then spawns an agent in the same message.
-        m.apply_update(&Update::Entry {
-            source: Source::Main,
-            entry: entry(
+        apply_entry(
+            &mut m,
+            ClaudeFile::Root,
+            entry(
                 r#"{"type":"assistant","uuid":"u2","parentUuid":"u1","timestamp":"2026-06-07T10:00:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"I will spawn a guide to research this."},{"type":"tool_use","id":"ag1","name":"Agent","input":{"description":"research","subagent_type":"guide","prompt":"go"}}]}}"#,
             ),
-        });
+        );
         let meta = crate::transcript::SubagentMeta {
             agent_type: Some("guide".into()),
             description: None,
             tool_use_id: Some("ag1".into()),
             stopped_by_user: None,
         };
-        m.apply_meta("sub1", None, &meta);
+        apply_meta(&mut m, "sub1", None, &meta);
 
         let ctx = m
             .provenance(m.agent("sub1").unwrap())
@@ -2458,25 +2386,22 @@ mod tests {
 
         // Cross-line reasoning: text on an EARLIER line (turns span multiple
         // JSONL lines), spawn on a later line with no text of its own.
-        m.apply_update(&Update::Entry {
-            source: Source::Main,
-            entry: entry(
-                r#"{"type":"assistant","uuid":"u3","parentUuid":"u2","timestamp":"2026-06-07T10:01:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Now a second agent for the docs."}]}}"#,
-            ),
-        });
-        m.apply_update(&Update::Entry {
-            source: Source::Main,
-            entry: entry(
-                r#"{"type":"assistant","uuid":"u4","parentUuid":"u3","timestamp":"2026-06-07T10:01:01.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"ag2","name":"Agent","input":{"description":"docs","subagent_type":"guide","prompt":"go"}}]}}"#,
-            ),
-        });
+        let mut decoder =
+            crate::formats::claude::ClaudeDecoder::new(m.session.clone(), ClaudeFile::Root);
+        let mut events = decoder.decode_test_entry(entry(
+            r#"{"type":"assistant","uuid":"u3","parentUuid":"u2","timestamp":"2026-06-07T10:01:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Now a second agent for the docs."}]}}"#,
+        ));
+        events.extend(decoder.decode_test_entry(entry(
+            r#"{"type":"assistant","uuid":"u4","parentUuid":"u3","timestamp":"2026-06-07T10:01:01.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"ag2","name":"Agent","input":{"description":"docs","subagent_type":"guide","prompt":"go"}}]}}"#,
+        )));
+        apply_events(&mut m, events);
         let meta2 = crate::transcript::SubagentMeta {
             agent_type: Some("guide".into()),
             description: None,
             tool_use_id: Some("ag2".into()),
             stopped_by_user: None,
         };
-        m.apply_meta("sub2", None, &meta2);
+        apply_meta(&mut m, "sub2", None, &meta2);
         assert_eq!(
             m.provenance(m.agent("sub2").unwrap())
                 .unwrap()
@@ -2488,26 +2413,23 @@ mod tests {
 
     #[test]
     fn provenance_reasoning_from_prior_thinking_line() {
-        let mut m = SessionModel::new("s1".into());
-        m.apply_update(&Update::Entry {
-            source: Source::Main,
-            entry: entry(
-                r#"{"type":"assistant","uuid":"t1","parentUuid":null,"timestamp":"2026-06-07T10:00:00.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"The user wants the preferences file located.","signature":"x"}]}}"#,
-            ),
-        });
-        m.apply_update(&Update::Entry {
-            source: Source::Main,
-            entry: entry(
-                r#"{"type":"assistant","uuid":"t2","parentUuid":"t1","timestamp":"2026-06-07T10:00:01.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"agx","name":"Agent","input":{"description":"find prefs","subagent_type":"guide","prompt":"go"}}]}}"#,
-            ),
-        });
+        let mut m = SessionModel::new("s".into());
+        let mut decoder =
+            crate::formats::claude::ClaudeDecoder::new(m.session.clone(), ClaudeFile::Root);
+        let mut events = decoder.decode_test_entry(entry(
+            r#"{"type":"assistant","uuid":"t1","parentUuid":null,"timestamp":"2026-06-07T10:00:00.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"The user wants the preferences file located.","signature":"x"}]}}"#,
+        ));
+        events.extend(decoder.decode_test_entry(entry(
+            r#"{"type":"assistant","uuid":"t2","parentUuid":"t1","timestamp":"2026-06-07T10:00:01.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"agx","name":"Agent","input":{"description":"find prefs","subagent_type":"guide","prompt":"go"}}]}}"#,
+        )));
+        apply_events(&mut m, events);
         let meta = crate::transcript::SubagentMeta {
             agent_type: Some("guide".into()),
             description: None,
             tool_use_id: Some("agx".into()),
             stopped_by_user: None,
         };
-        m.apply_meta("subx", None, &meta);
+        apply_meta(&mut m, "subx", None, &meta);
         assert_eq!(
             m.provenance(m.agent("subx").unwrap())
                 .unwrap()
@@ -2521,9 +2443,9 @@ mod tests {
     fn meta_after_completion_marks_subagent_done() {
         // Live attach order: the WHOLE main transcript (spawn + completion)
         // applies before the directory scan delivers the subagent meta.
-        let mut m = SessionModel::new("s1".into());
-        m.apply_update(&assistant_tool_use(Source::Main, "ag1", "Agent"));
-        m.apply_update(&tool_result(Source::Main, "ag1", false));
+        let mut m = SessionModel::new("s".into());
+        apply_events(&mut m, assistant_tool_use(ClaudeFile::Root, "ag1", "Agent"));
+        apply_events(&mut m, tool_result(ClaudeFile::Root, "ag1", false));
 
         let meta = crate::transcript::SubagentMeta {
             agent_type: Some("guide".into()),
@@ -2531,7 +2453,7 @@ mod tests {
             tool_use_id: Some("ag1".into()),
             stopped_by_user: None,
         };
-        m.apply_meta("sub1", None, &meta);
+        apply_meta(&mut m, "sub1", None, &meta);
         assert_eq!(
             m.agent("sub1").unwrap().status,
             AgentStatus::Done,
@@ -2539,26 +2461,26 @@ mod tests {
         );
 
         // Failed variant.
-        m.apply_update(&assistant_tool_use(Source::Main, "ag2", "Agent"));
-        m.apply_update(&tool_result(Source::Main, "ag2", true));
+        apply_events(&mut m, assistant_tool_use(ClaudeFile::Root, "ag2", "Agent"));
+        apply_events(&mut m, tool_result(ClaudeFile::Root, "ag2", true));
         let meta_err = crate::transcript::SubagentMeta {
             agent_type: Some("guide".into()),
             description: None,
             tool_use_id: Some("ag2".into()),
             stopped_by_user: None,
         };
-        m.apply_meta("sub2", None, &meta_err);
+        apply_meta(&mut m, "sub2", None, &meta_err);
         assert_eq!(m.agent("sub2").unwrap().status, AgentStatus::Failed);
 
         // Still-pending spawn stays Running.
-        m.apply_update(&assistant_tool_use(Source::Main, "ag3", "Agent"));
+        apply_events(&mut m, assistant_tool_use(ClaudeFile::Root, "ag3", "Agent"));
         let meta_pending = crate::transcript::SubagentMeta {
             agent_type: Some("guide".into()),
             description: None,
             tool_use_id: Some("ag3".into()),
             stopped_by_user: None,
         };
-        m.apply_meta("sub3", None, &meta_pending);
+        apply_meta(&mut m, "sub3", None, &meta_pending);
         assert_eq!(m.agent("sub3").unwrap().status, AgentStatus::Running);
     }
 
@@ -2566,7 +2488,7 @@ mod tests {
     fn last_active_agent_follows_latest_timestamp() {
         let mut m = SessionModel::new("s".into());
         // Main is seeded; give it activity at T1.
-        m.apply_update(&assistant_tool_use(Source::Main, "t1", "Bash"));
+        apply_events(&mut m, assistant_tool_use(ClaudeFile::Root, "t1", "Bash"));
 
         // A subagent spawns but has no timestamped activity yet: the
         // timestamped main still wins (None < Some).
@@ -2576,7 +2498,7 @@ mod tests {
             tool_use_id: Some("t1".into()),
             stopped_by_user: None,
         };
-        m.apply_meta("sub1", None, &meta);
+        apply_meta(&mut m, "sub1", None, &meta);
         assert_eq!(m.last_active_agent_id().as_deref(), Some(MAIN_ID));
 
         // The subagent acts later: it becomes the active one.
@@ -2592,15 +2514,12 @@ mod tests {
         assert_eq!(m.last_active_agent_id().as_deref(), Some(MAIN_ID));
     }
 
-    fn tool_result(source: Source, tool_id: &str, is_error: bool) -> Update {
+    fn tool_result(source: ClaudeFile, tool_id: &str, is_error: bool) -> Vec<SessionEvent> {
         let err = if is_error { r#","is_error":true"# } else { "" };
         let line = format!(
             r#"{{"type":"user","uuid":"u2","parentUuid":"u1","timestamp":"2026-06-05T13:51:16.000Z","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{tool_id}","content":"done"{err}}}]}}}}"#
         );
-        Update::Entry {
-            source,
-            entry: entry(&line),
-        }
+        crate::test_support::claude_events(&SessionKey::from("s"), source, entry(&line))
     }
 
     #[test]
@@ -2613,8 +2532,8 @@ mod tests {
 
     #[test]
     fn tool_pairing_pending_then_ok() {
-        let mut m = SessionModel::new("s1".into());
-        m.apply_update(&assistant_tool_use(Source::Main, "t1", "Bash"));
+        let mut m = SessionModel::new("s".into());
+        apply_events(&mut m, assistant_tool_use(ClaudeFile::Root, "t1", "Bash"));
         let main = m.agent(MAIN_ID).unwrap();
         assert_eq!(main.tool_calls.len(), 1);
         assert_eq!(main.tool_calls[0].state, ToolState::Pending);
@@ -2622,7 +2541,7 @@ mod tests {
         assert_eq!(main.output_tokens, 42);
         assert_eq!(main.model.as_deref(), Some("claude-opus-4-8"));
 
-        m.apply_update(&tool_result(Source::Main, "t1", false));
+        apply_events(&mut m, tool_result(ClaudeFile::Root, "t1", false));
         let tc = &m.agent(MAIN_ID).unwrap().tool_calls[0];
         assert_eq!(tc.state, ToolState::Ok);
         // The result's timestamp is recorded as the finish time → duration
@@ -2673,9 +2592,9 @@ mod tests {
 
     #[test]
     fn tool_pairing_error() {
-        let mut m = SessionModel::new("s1".into());
-        m.apply_update(&assistant_tool_use(Source::Main, "t1", "Bash"));
-        m.apply_update(&tool_result(Source::Main, "t1", true));
+        let mut m = SessionModel::new("s".into());
+        apply_events(&mut m, assistant_tool_use(ClaudeFile::Root, "t1", "Bash"));
+        apply_events(&mut m, tool_result(ClaudeFile::Root, "t1", true));
         assert_eq!(
             m.agent(MAIN_ID).unwrap().tool_calls[0].state,
             ToolState::Err
@@ -2684,7 +2603,7 @@ mod tests {
 
     #[test]
     fn direct_subagent_spawn_running_done() {
-        let mut m = SessionModel::new("s1".into());
+        let mut m = SessionModel::new("s".into());
         // meta introduces the subagent (structural), parented to main, spawned
         // by tool use "ag1".
         let meta = SubagentMeta {
@@ -2693,7 +2612,7 @@ mod tests {
             tool_use_id: Some("ag1".into()),
             stopped_by_user: None,
         };
-        let structural = m.apply_meta("abc123", None, &meta);
+        let structural = apply_meta(&mut m, "abc123", None, &meta);
         assert!(structural);
         let a = m.agent("abc123").unwrap();
         assert_eq!(a.kind, AgentKind::Subagent);
@@ -2702,24 +2621,24 @@ mod tests {
         assert_eq!(a.spawned_by_tool_use.as_deref(), Some("ag1"));
 
         // Re-applying the same meta is NOT structural.
-        assert!(!m.apply_meta("abc123", None, &meta));
+        assert!(!apply_meta(&mut m, "abc123", None, &meta));
 
         // The main transcript's tool_result for ag1 completes the subagent.
-        m.apply_update(&tool_result(Source::Main, "ag1", false));
+        apply_events(&mut m, tool_result(ClaudeFile::Root, "ag1", false));
         assert_eq!(m.agent("abc123").unwrap().status, AgentStatus::Done);
     }
 
     #[test]
     fn direct_subagent_failed() {
-        let mut m = SessionModel::new("s1".into());
+        let mut m = SessionModel::new("s".into());
         let meta = SubagentMeta {
             agent_type: Some("guide".into()),
             description: None,
             tool_use_id: Some("ag1".into()),
             stopped_by_user: None,
         };
-        m.apply_meta("abc123", None, &meta);
-        m.apply_update(&tool_result(Source::Main, "ag1", true));
+        apply_meta(&mut m, "abc123", None, &meta);
+        apply_events(&mut m, tool_result(ClaudeFile::Root, "ag1", true));
         assert_eq!(m.agent("abc123").unwrap().status, AgentStatus::Failed);
     }
 
@@ -2737,20 +2656,14 @@ mod tests {
         };
 
         // Launch first, then the subagent meta creates the group.
-        let mut a = SessionModel::new("s1".into());
-        a.apply_update(&Update::Entry {
-            source: Source::Main,
-            entry: entry(LAUNCH),
-        });
-        a.apply_meta("wfsub1", Some("wf-99"), &meta);
+        let mut a = SessionModel::new("s".into());
+        apply_entry(&mut a, ClaudeFile::Root, entry(LAUNCH));
+        apply_meta(&mut a, "wfsub1", Some("wf-99"), &meta);
 
         // Meta first, then the launch labels the existing group.
-        let mut b = SessionModel::new("s1".into());
-        b.apply_meta("wfsub1", Some("wf-99"), &meta);
-        b.apply_update(&Update::Entry {
-            source: Source::Main,
-            entry: entry(LAUNCH),
-        });
+        let mut b = SessionModel::new("s".into());
+        apply_meta(&mut b, "wfsub1", Some("wf-99"), &meta);
+        apply_entry(&mut b, ClaudeFile::Root, entry(LAUNCH));
 
         for (name, m) in [("launch-first", &a), ("meta-first", &b)] {
             let group = m.agent("wf-99").expect("group exists");
@@ -2779,24 +2692,27 @@ mod tests {
     /// so an unrelated workflow ack never adds an empty, parentless node.
     #[test]
     fn workflow_launch_alone_creates_no_group_node() {
-        let mut m = SessionModel::new("s1".into());
-        m.apply_update(&Update::Entry {
-            source: Source::Main,
-            entry: entry(r#"{"type":"user","uuid":"u","timestamp":"2026-06-05T10:00:00.000Z","toolUseResult":{"taskType":"local_workflow","workflowName":"code-review","runId":"wf-99"}}"#),
-        });
+        let mut m = SessionModel::new("s".into());
+        apply_entry(
+            &mut m,
+            ClaudeFile::Root,
+            entry(
+                r#"{"type":"user","uuid":"u","timestamp":"2026-06-05T10:00:00.000Z","toolUseResult":{"taskType":"local_workflow","workflowName":"code-review","runId":"wf-99"}}"#,
+            ),
+        );
         assert!(m.agent("wf-99").is_none(), "no group without its directory");
     }
 
     #[test]
     fn workflow_group_and_journal_completion() {
-        let mut m = SessionModel::new("s1".into());
+        let mut m = SessionModel::new("s".into());
         let meta = SubagentMeta {
             agent_type: Some("workflow-subagent".into()),
             description: None,
             tool_use_id: None,
             stopped_by_user: None,
         };
-        let structural = m.apply_meta("wfsub1", Some("wf-99"), &meta);
+        let structural = apply_meta(&mut m, "wfsub1", Some("wf-99"), &meta);
         assert!(structural);
         // Group node created, parented to main.
         let group = m.agent("wf-99").unwrap();
@@ -2808,24 +2724,27 @@ mod tests {
 
         // A journal `result` for wfsub1 marks it done.
         let line = r#"{"type":"result","key":"k","agentId":"wfsub1","result":{"ok":true}}"#;
-        m.apply_update(&Update::Entry {
-            source: Source::Journal("wf-99".into()),
-            entry: entry(line),
-        });
+        apply_entry(
+            &mut m,
+            ClaudeFile::WorkflowJournal {
+                workflow: "wf-99".into(),
+            },
+            entry(line),
+        );
         assert_eq!(m.agent("wfsub1").unwrap().status, AgentStatus::Done);
     }
 
     #[test]
     fn workflow_group_rolls_up_from_children() {
-        let mut m = SessionModel::new("s1".into());
+        let mut m = SessionModel::new("s".into());
         let meta = SubagentMeta {
             agent_type: Some("workflow-subagent".into()),
             description: None,
             tool_use_id: None,
             stopped_by_user: None,
         };
-        m.apply_meta("c1", Some("wf-1"), &meta);
-        m.apply_meta("c2", Some("wf-1"), &meta);
+        apply_meta(&mut m, "c1", Some("wf-1"), &meta);
+        apply_meta(&mut m, "c2", Some("wf-1"), &meta);
 
         // Both children running → group stays running.
         m.recompute_workflow_status();
@@ -2844,14 +2763,14 @@ mod tests {
 
     #[test]
     fn workflow_group_all_done_is_done() {
-        let mut m = SessionModel::new("s1".into());
+        let mut m = SessionModel::new("s".into());
         let meta = SubagentMeta {
             agent_type: Some("workflow-subagent".into()),
             description: None,
             tool_use_id: None,
             stopped_by_user: None,
         };
-        m.apply_meta("c1", Some("wf-1"), &meta);
+        apply_meta(&mut m, "c1", Some("wf-1"), &meta);
         m.agents.get_mut("c1").unwrap().status = AgentStatus::Done;
         m.recompute_workflow_status();
         assert_eq!(m.agent("wf-1").unwrap().status, AgentStatus::Done);
@@ -2859,10 +2778,19 @@ mod tests {
 
     #[test]
     fn subagent_file_activity_creates_node() {
-        let mut m = SessionModel::new("s1".into());
+        let mut m = SessionModel::new("s".into());
         // An assistant turn arrives in a subagent file before its meta.
-        let structural =
-            m.apply_update(&assistant_tool_use(Source::Sub("zz9".into()), "t1", "Read"));
+        let structural = apply_events(
+            &mut m,
+            assistant_tool_use(
+                ClaudeFile::Subagent {
+                    agent_id: "zz9".into(),
+                    workflow: None,
+                },
+                "t1",
+                "Read",
+            ),
+        );
         assert!(structural);
         let a = m.agent("zz9").unwrap();
         assert_eq!(a.kind, AgentKind::Subagent);
@@ -2871,60 +2799,63 @@ mod tests {
 
     /// An assistant turn line carrying a `requestId` and a fixed
     /// `usage.output_tokens` (no tool_use), to model a multi-line turn.
-    fn assistant_turn(source: Source, request_id: &str, out_tokens: u64) -> Update {
+    fn assistant_turn(source: ClaudeFile, request_id: &str, out_tokens: u64) -> Vec<SessionEvent> {
         let line = format!(
             r#"{{"type":"assistant","uuid":"u1","parentUuid":null,"timestamp":"2026-06-05T13:51:15.151Z","requestId":"{request_id}","message":{{"role":"assistant","model":"claude-opus-4-8","content":[{{"type":"text","text":"hi"}}],"usage":{{"output_tokens":{out_tokens}}}}}}}"#
         );
-        Update::Entry {
-            source,
-            entry: entry(&line),
-        }
+        crate::test_support::claude_events(&SessionKey::from("s"), source, entry(&line))
     }
 
     #[test]
     fn output_tokens_counted_once_per_request_id() {
         // Claude Code emits the same requestId across multiple lines of one
         // turn, each repeating the cumulative usage. We must count it once.
-        let mut m = SessionModel::new("s1".into());
-        m.apply_update(&assistant_turn(Source::Main, "req_A", 418));
-        m.apply_update(&assistant_turn(Source::Main, "req_A", 418));
-        m.apply_update(&assistant_turn(Source::Main, "req_A", 418));
+        let mut m = SessionModel::new("s".into());
+        apply_events(&mut m, assistant_turn(ClaudeFile::Root, "req_A", 418));
+        apply_events(&mut m, assistant_turn(ClaudeFile::Root, "req_A", 418));
+        apply_events(&mut m, assistant_turn(ClaudeFile::Root, "req_A", 418));
         assert_eq!(m.agent(MAIN_ID).unwrap().output_tokens, 418);
 
         // A new turn (different requestId) adds its own tokens.
-        m.apply_update(&assistant_turn(Source::Main, "req_B", 100));
-        m.apply_update(&assistant_turn(Source::Main, "req_B", 100));
+        apply_events(&mut m, assistant_turn(ClaudeFile::Root, "req_B", 100));
+        apply_events(&mut m, assistant_turn(ClaudeFile::Root, "req_B", 100));
         assert_eq!(m.agent(MAIN_ID).unwrap().output_tokens, 518);
     }
 
     #[test]
     fn output_tokens_without_request_id_sum_per_line() {
         // Defensive fallback: lines lacking a requestId can't be deduped.
-        let mut m = SessionModel::new("s1".into());
-        m.apply_update(&assistant_tool_use(Source::Main, "t1", "Bash")); // 42, no requestId
-        m.apply_update(&assistant_tool_use(Source::Main, "t2", "Bash")); // 42, no requestId
+        let mut m = SessionModel::new("s".into());
+        let mut decoder =
+            crate::formats::claude::ClaudeDecoder::new(m.session.clone(), ClaudeFile::Root);
+        for tool_id in ["t1", "t2"] {
+            let line = format!(
+                r#"{{"type":"assistant","uuid":"{tool_id}","timestamp":"2026-06-05T13:51:15.151Z","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"{tool_id}","name":"Bash","input":{{}}}}],"usage":{{"output_tokens":42}}}}}}"#
+            );
+            apply_events(&mut m, decoder.decode_test_entry(entry(&line)));
+        }
         assert_eq!(m.agent(MAIN_ID).unwrap().output_tokens, 84);
     }
 
     #[test]
     fn duplicate_tool_use_not_double_counted() {
-        let mut m = SessionModel::new("s1".into());
-        let u = assistant_tool_use(Source::Main, "t1", "Bash");
-        m.apply_update(&u);
-        m.apply_update(&u);
+        let mut m = SessionModel::new("s".into());
+        let u = assistant_tool_use(ClaudeFile::Root, "t1", "Bash");
+        apply_events(&mut m, u.clone());
+        apply_events(&mut m, u);
         assert_eq!(m.agent(MAIN_ID).unwrap().tool_calls.len(), 1);
     }
 
     #[test]
     fn end_of_stream_idles_interactive_agents_only() {
-        let mut m = SessionModel::new("s1".into());
+        let mut m = SessionModel::new("s".into());
         let spawned = crate::transcript::SubagentMeta {
             agent_type: Some("guide".into()),
             description: None,
             tool_use_id: Some("t1".into()),
             stopped_by_user: None,
         };
-        m.apply_meta("sub1", None, &spawned);
+        apply_meta(&mut m, "sub1", None, &spawned);
         m.end_of_stream();
         // Interactive agents can't complete — they just go quiet (Idle).
         assert_eq!(m.agent(MAIN_ID).unwrap().status, AgentStatus::Idle);

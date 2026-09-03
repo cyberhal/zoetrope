@@ -72,7 +72,9 @@ jobs:
   # The browser frontend is its own workspace (wasm32-only — see the
   # [workspace] comment in Cargo.toml), so nothing above touches it.
   wasm:
-    name: Check wasm frontend
+    # Separate stable policy; web/wasm declares rust-version 1.90 while the
+    # installable root crate remains on its independently tested 1.88 MSRV.
+    name: Check wasm frontend (stable, Rust 1.90+)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

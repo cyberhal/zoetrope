@@ -815,20 +815,25 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tailer::{UiEvent, Update};
+    use crate::formats::claude::ClaudeFile;
+    use crate::tailer::UiEvent;
     use crate::transcript::SubagentMeta;
 
     fn meta_update(agent_id: &str) -> crate::event::SessionEvent {
-        crate::tailer::item::test_event(&Update::SubagentMeta {
-            agent_id: agent_id.to_string(),
-            workflow: None,
-            meta: SubagentMeta {
+        crate::test_support::metadata_events(
+            &crate::event::SessionKey::from("s"),
+            agent_id,
+            None,
+            &SubagentMeta {
                 agent_type: Some("guide".into()),
                 description: None,
                 tool_use_id: Some("ag1".into()),
                 stopped_by_user: None,
             },
-        })
+        )
+        .into_iter()
+        .next()
+        .expect("metadata yields discovery")
     }
 
     #[test]
@@ -1088,7 +1093,7 @@ mod tests {
 
     #[test]
     fn seek_prompt_steps_between_eras() {
-        use crate::tailer::{ReplayItem, Source};
+        use crate::tailer::ReplayItem;
         let ts = |s: &str| s.parse::<chrono::DateTime<chrono::Utc>>().unwrap();
         let prompt = |uuid: &str, t: &str, text: &str| {
             let line = format!(
@@ -1096,10 +1101,11 @@ mod tests {
             );
             ReplayItem::at(
                 Some(ts(t)),
-                Update::Entry {
-                    source: Source::Main,
-                    entry: crate::transcript::parse_line(&line).unwrap(),
-                },
+                crate::test_support::claude_event(
+                    &crate::event::SessionKey::from("s"),
+                    ClaudeFile::Root,
+                    crate::transcript::parse_line(&line).unwrap(),
+                ),
             )
         };
         let items = vec![
@@ -1310,13 +1316,14 @@ mod tests {
     #[test]
     fn pausing_at_the_live_edge_buffers_appends_instead_of_snapping() {
         let e = |ts: &str| {
-            crate::tailer::item::test_event(&Update::Entry {
-            source: crate::tailer::Source::Main,
-            entry: crate::transcript::parse_line(&format!(
+            crate::test_support::claude_event(
+            &crate::event::SessionKey::from("s"),
+            ClaudeFile::Root,
+            crate::transcript::parse_line(&format!(
                 r#"{{"type":"user","uuid":"u","timestamp":"{ts}","message":{{"role":"user","content":"x"}}}}"#
             ))
             .unwrap(),
-        })
+        )
         };
         let mut app = App::new("s".into(), Mode::Live);
         app.handle_ui_event(UiEvent::SessionReset {
@@ -1380,13 +1387,14 @@ mod tests {
             session: "s".into(),
         });
         let e = |ts: &str| {
-            crate::tailer::item::test_event(&Update::Entry {
-            source: crate::tailer::Source::Main,
-            entry: crate::transcript::parse_line(&format!(
+            crate::test_support::claude_event(
+            &crate::event::SessionKey::from("s"),
+            ClaudeFile::Root,
+            crate::transcript::parse_line(&format!(
                 r#"{{"type":"user","uuid":"u","timestamp":"{ts}","message":{{"role":"user","content":"x"}}}}"#
             ))
             .unwrap(),
-        })
+        )
         };
         // An out-of-order batch (file-grouped arrival / backfilled block).
         app.handle_ui_event(UiEvent::Batch {

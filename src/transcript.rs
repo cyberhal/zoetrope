@@ -88,106 +88,6 @@ pub enum Entry {
     Unknown,
 }
 
-impl Entry {
-    /// Untimed session-level metadata that is routed to [`SessionInfo`] and kept
-    /// OFF the timeline (`ai-title`, `last-prompt`, `mode`, `permission-mode`,
-    /// `file-history-snapshot`, `queue-operation`). None of these are timed
-    /// activity: being untimed they would otherwise sort to the front and push
-    /// the scrubber's start off the left edge. `ai-title` in particular is
-    /// session identity (the header title), not an event — so it lives in the
-    /// info store, never as a fabricated-date timeline item.
-    ///
-    /// [`SessionInfo`]: crate::state::SessionInfo
-    pub fn is_timeline_noise(&self) -> bool {
-        matches!(
-            self,
-            Entry::AiTitle(_)
-                | Entry::LastPrompt(_)
-                | Entry::Mode(_)
-                | Entry::PermissionMode(_)
-                | Entry::FileHistorySnapshot(_)
-                | Entry::QueueOperation(_)
-        )
-    }
-
-    /// Number of `tool_use` blocks in this entry (an assistant turn may issue
-    /// several). Drives the scrubber's tool-activity sparkline. Non-assistant
-    /// entries are 0.
-    pub fn tool_use_count(&self) -> usize {
-        match self {
-            Entry::Assistant(e) => e.message.as_ref().map_or(0, |m| {
-                m.content
-                    .iter()
-                    .filter(|b| matches!(b, ContentBlock::ToolUse(_)))
-                    .count()
-            }),
-            _ => 0,
-        }
-    }
-
-    /// Number of agent/workflow *spawn* tool calls in this entry (`Agent` /
-    /// `Workflow` tools) — the branch points, marked distinctly on the scrubber.
-    pub fn spawn_count(&self) -> usize {
-        self.spawn_tool_use_ids().len()
-    }
-
-    /// The `tool_use.id`s of the agent/workflow *spawn* calls in this entry. Used
-    /// as the join key to the subagent it spawns: a discovered subagent's meta
-    /// carries the same id, so a spawn with a known meta is marked at the
-    /// subagent's birth instead of here at the call. Empty for non-spawn entries.
-    pub fn spawn_tool_use_ids(&self) -> Vec<&str> {
-        match self {
-            Entry::Assistant(e) => e.message.as_ref().map_or(Vec::new(), |m| {
-                m.content
-                    .iter()
-                    .filter_map(|b| match b {
-                        ContentBlock::ToolUse(tu)
-                            if tu.name.as_deref().is_some_and(is_spawn_tool) =>
-                        {
-                            Some(tu.id.as_deref().unwrap_or_default())
-                        }
-                        _ => None,
-                    })
-                    .collect()
-            }),
-            _ => Vec::new(),
-        }
-    }
-
-    /// Number of *failed* tool results in this entry (`tool_result` with
-    /// `is_error: true`) — surfaced as a distinct marker so failures aren't
-    /// invisible on the timeline. (Results land in `user` entries.)
-    pub fn tool_failure_count(&self) -> usize {
-        match self {
-            Entry::User(e) => match e.message.as_ref().and_then(|m| m.content.as_ref()) {
-                Some(UserContent::Blocks(blocks)) => blocks
-                    .iter()
-                    .filter(|b| {
-                        matches!(b, UserContentBlock::ToolResult(tr) if tr.is_error == Some(true))
-                    })
-                    .count(),
-                _ => 0,
-            },
-            _ => 0,
-        }
-    }
-}
-
-/// Whether a tool name is an agent/workflow *spawn* (a branch point). Single
-/// source for the rule — `Task` is Claude Code's legacy name for the `Agent`
-/// tool, so all three count as spawns (provenance, scrubber markers, summaries).
-pub fn is_spawn_tool(name: &str) -> bool {
-    matches!(name, "Agent" | "Task" | "Workflow")
-}
-
-/// Session id from a transcript path: the file stem (`<uuid>.jsonl` → `<uuid>`),
-/// lossy, empty if the path has no stem. Single source for the id-from-path rule.
-pub fn session_id_from_path(path: &std::path::Path) -> String {
-    path.file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default()
-}
-
 // ---------------------------------------------------------------------------
 // Envelope (transcript entries only)
 // ---------------------------------------------------------------------------
@@ -681,21 +581,6 @@ pub fn sanitize_cwd(cwd: &std::path::Path) -> String {
         .collect()
 }
 
-/// The `~/.claude/projects` root, if a home directory can be resolved.
-fn claude_projects_root() -> Option<std::path::PathBuf> {
-    #[allow(deprecated)]
-    let home = std::env::home_dir()
-        .filter(|h| !h.as_os_str().is_empty())
-        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))?;
-    Some(home.join(".claude").join("projects"))
-}
-
-/// Absolute path to the `~/.claude/projects/<sanitized-cwd>` directory for a
-/// given cwd.
-pub fn project_dir(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
-    Some(claude_projects_root()?.join(sanitize_cwd(cwd)))
-}
-
 /// Whether a filename stem is a canonical lowercase UUID (8-4-4-4-12 hex).
 ///
 /// Transcript files are exactly `<uuid>.jsonl`; this filter rejects sidecars
@@ -720,35 +605,6 @@ pub fn is_session_file(path: &std::path::Path) -> bool {
     path.file_stem()
         .and_then(|s| s.to_str())
         .is_some_and(is_uuid)
-}
-
-/// Find the newest `<uuid>.jsonl` transcript directly inside `project_dir`
-/// (ignoring non-transcript files like `skill-injections.jsonl`,
-/// `sessions-index.json`, and subdirectories).
-pub fn latest_session_file(project_dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
-    for entry in std::fs::read_dir(project_dir).ok()? {
-        let Ok(entry) = entry else { continue };
-        let path = entry.path();
-        if !is_session_file(&path) {
-            continue;
-        }
-        let Ok(meta) = entry.metadata() else { continue };
-        if !meta.is_file() {
-            continue;
-        }
-        let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-        // Newest wins; equal mtimes break ties on the (lexicographically greater)
-        // path so the choice is deterministic, not `read_dir` order.
-        let better = match &best {
-            None => true,
-            Some((bt, bp)) => mtime > *bt || (mtime == *bt && path > *bp),
-        };
-        if better {
-            best = Some((mtime, path));
-        }
-    }
-    best.map(|(_, p)| p)
 }
 
 // ---------------------------------------------------------------------------
@@ -855,48 +711,6 @@ pub fn workflow_dir(subagents_dir: &std::path::Path, wf_id: &str) -> std::path::
 mod tests {
     use super::*;
     use std::path::Path;
-
-    #[test]
-    fn claude_fixture_characterizes_the_adapter_contract_before_cutover() {
-        let entries: Vec<Entry> = include_str!("../tests/fixtures/claude/characterization.jsonl")
-            .lines()
-            .filter_map(parse_line)
-            .collect();
-
-        let prompts: Vec<&str> = entries
-            .iter()
-            .filter_map(|entry| match entry {
-                Entry::User(user) if user.is_human_prompt() => user.prompt_text(),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(prompts, ["Map the dependency graph."]);
-        assert_eq!(entries.iter().map(Entry::tool_use_count).sum::<usize>(), 2);
-        assert_eq!(entries.iter().map(Entry::spawn_count).sum::<usize>(), 1);
-        assert_eq!(
-            entries.iter().map(Entry::tool_failure_count).sum::<usize>(),
-            1
-        );
-
-        let assistant = entries.iter().find_map(|entry| match entry {
-            Entry::Assistant(assistant) => Some(assistant),
-            _ => None,
-        });
-        let message = assistant.and_then(|assistant| assistant.message.as_ref());
-        assert_eq!(
-            message.and_then(|message| message.model.as_deref()),
-            Some("claude-test")
-        );
-        assert_eq!(
-            message
-                .and_then(|message| message.usage.as_ref())
-                .and_then(|usage| usage.output_tokens),
-            Some(12)
-        );
-        assert!(
-            matches!(entries.last(), Some(Entry::AiTitle(title)) if title.title.as_deref() == Some("Dependency map"))
-        );
-    }
 
     #[test]
     fn parse_task_notification_extracts_id_and_status() {
@@ -1089,28 +903,6 @@ mod tests {
     }
 
     // --- Flat metadata: no uuid/timestamp envelope ------------------------
-
-    #[test]
-    fn tool_use_count_counts_blocks() {
-        // An assistant turn issuing two tool calls → count 2.
-        let line = r#"{"type":"assistant","uuid":"a","timestamp":"2026-06-05T10:00:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"on it"},{"type":"tool_use","id":"t1","name":"Bash","input":{}},{"type":"tool_use","id":"t2","name":"Read","input":{}}]}}"#;
-        assert_eq!(parse_line(line).unwrap().tool_use_count(), 2);
-        // A user entry has none.
-        let u = r#"{"type":"user","uuid":"u","timestamp":"2026-06-05T10:00:01.000Z","message":{"role":"user","content":"hi"}}"#;
-        assert_eq!(parse_line(u).unwrap().tool_use_count(), 0);
-        // Spawn count: only Agent/Workflow tools.
-        let s = r#"{"type":"assistant","uuid":"a","message":{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"Agent","input":{}},{"type":"tool_use","id":"t2","name":"Bash","input":{}}]}}"#;
-        assert_eq!(parse_line(s).unwrap().spawn_count(), 1);
-    }
-
-    #[test]
-    fn tool_failure_count_counts_errored_results() {
-        let fail = r#"{"type":"user","uuid":"u","timestamp":"2026-06-05T10:00:00.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"boom","is_error":true},{"type":"tool_result","tool_use_id":"t2","content":"ok"}]}}"#;
-        assert_eq!(parse_line(fail).unwrap().tool_failure_count(), 1);
-        // No error flag → success → not counted.
-        let ok = r#"{"type":"user","uuid":"u","timestamp":"2026-06-05T10:00:00.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"done"}]}}"#;
-        assert_eq!(parse_line(ok).unwrap().tool_failure_count(), 0);
-    }
 
     #[test]
     fn flat_ai_title_uses_aititle_key() {
@@ -1378,34 +1170,6 @@ mod tests {
         assert_eq!(found[1].agent_id, "a9dd56e1137830d9d");
         assert_eq!(found[0].workflow.as_deref(), Some("wf_x"));
         assert_eq!(found[0].meta, tmp.join("agent-a5301c73ab04591b2.meta.json"));
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn latest_session_file_picks_newest_uuid_jsonl() {
-        let tmp = std::env::temp_dir().join(format!(
-            "zoetrope-latest-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&tmp).expect("mkdir");
-        let older = tmp.join("11111111-1111-1111-1111-111111111111.jsonl");
-        let newer = tmp.join("22222222-2222-2222-2222-222222222222.jsonl");
-        // Non-transcript files must be ignored even if they are the newest.
-        std::fs::write(tmp.join("skill-injections.jsonl"), b"{}\n").unwrap();
-        std::fs::write(tmp.join("sessions-index.json"), b"{}\n").unwrap();
-        std::fs::write(&older, b"{}\n").unwrap();
-        // Ensure a real mtime gap across coarse-granularity filesystems, then
-        // write `newer` strictly after `older`.
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(&newer, b"{}\n").unwrap();
-
-        let latest = latest_session_file(&tmp).expect("finds one");
-        assert_eq!(latest, newer, "newest uuid .jsonl wins; sidecars ignored");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

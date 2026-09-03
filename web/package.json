@@ -3,7 +3,7 @@
   "type": "module",
   "private": true,
   "version": "0.1.0",
-  "description": "Website + in-browser app for zoetrope — the Claude Code session visualizer.",
+  "description": "Website + browser app for visualizing Claude Code and Codex sessions.",
   "scripts": {
     "dev": "astro dev",
     "start": "astro dev",

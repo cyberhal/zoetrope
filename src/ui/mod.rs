@@ -932,7 +932,7 @@ mod tests {
     use super::{compute_scrubber_tally, truncate, truncate_tail, wrap};
     use crate::event::{Provider, SessionKey};
     use crate::formats::claude::{ClaudeDecoder, ClaudeFile};
-    use crate::tailer::{ReplayItem, Source, Update};
+    use crate::tailer::ReplayItem;
 
     #[test]
     fn truncate_basic() {
@@ -1026,25 +1026,30 @@ mod tests {
         let call_item = || {
             ReplayItem::at(
                 Some(ts.parse().unwrap()),
-                Update::Entry {
-                    source: Source::Main,
-                    entry: crate::transcript::parse_line(&call).unwrap(),
-                },
+                crate::test_support::claude_event(
+                    &crate::event::SessionKey::from("s"),
+                    crate::formats::claude::ClaudeFile::Root,
+                    crate::transcript::parse_line(&call).unwrap(),
+                ),
             )
         };
         let meta_item = |tool_use_id: Option<&str>| {
             ReplayItem::at(
                 Some("2026-06-05T10:00:05.000Z".parse().unwrap()),
-                Update::SubagentMeta {
-                    agent_id: "a1000000000000001".into(),
-                    workflow: None,
-                    meta: crate::transcript::SubagentMeta {
+                crate::test_support::metadata_events(
+                    &crate::event::SessionKey::from("s"),
+                    "a1000000000000001",
+                    None,
+                    &crate::transcript::SubagentMeta {
                         agent_type: Some("subagent".into()),
                         description: None,
                         tool_use_id: tool_use_id.map(str::to_string),
                         stopped_by_user: None,
                     },
-                },
+                )
+                .into_iter()
+                .find(|event| matches!(event.kind, crate::event::EventKind::AgentDiscovered(_)))
+                .unwrap(),
             )
         };
 

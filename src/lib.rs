@@ -30,8 +30,11 @@ pub mod event;
 pub mod formats;
 pub mod state;
 pub mod tailer;
-pub mod transcript;
+pub(crate) mod transcript;
 pub mod ui;
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 // The native frontend: terminal loop + crossterm input.
 #[cfg(feature = "native")]

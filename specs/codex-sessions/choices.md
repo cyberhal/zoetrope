@@ -2,6 +2,15 @@
 
 ## Needs user
 
+### The browser workspace follows stable Rust with a 1.90 floor
+
+- **When:** Slice 05 (`codex-slice5`).
+- **The choice:** Keep the installable root crate on its verified Rust 1.88 MSRV, while the separate unpublished browser workspace declares Rust 1.90 and is checked with stable Rust because its current renderer dependency requires that floor.
+- **The gap:** The original acceptance text implied that every workspace shared Rust 1.88, but lowering or replacing the renderer is outside this slice and raising the CLI MSRV would couple unrelated products.
+- **The reach:** Native users retain the existing MSRV; browser contributors and CI need stable Rust 1.90 or newer. A later renderer change can reunify the policies.
+- **Verdict:** needs-user — the split is truthful and reversible, but maintaining two toolchain floors is a product/maintenance choice.
+- **Confidence:** high.
+
 ### Equal-timestamp normalized facts share one scrubber position
 
 - **When:** Slice 03 (`codex-slice3`).
@@ -39,6 +48,33 @@
 - **Confidence:** medium.
 
 ## Sound
+
+### Portable Claude identity uses recorded metadata, then the caller's selected filename
+
+- **When:** Slice 05 (`codex-slice5`).
+- **The choice:** Portable replay uses a non-whitespace Claude `sessionId` when present and otherwise requires the browser caller to supply the selected main filename stem. Codex always replaces that hint with the non-whitespace thread id from `session_meta`. Valid identifiers retain their recorded bytes; whitespace is a validity check, not a normalization step.
+- **The gap:** Browser bytes have no native path manifest, while the app requires the same real provider-qualified identity used by event actors and stale-batch rejection.
+- **The reach:** Browser loads no longer invent a shared `session` key, and explicit Codex children remain the logical root of their own view.
+- **Verdict:** sound — identity comes from provider evidence or the user-selected file, never a format masquerade or constant.
+- **Confidence:** high.
+
+### Portable lifecycle dating never withholds a normalized fact
+
+- **When:** Slice 05 (`codex-slice5`).
+- **The choice:** The browser feed resolves `AtAgentStart` and `AtAgentEnd` immediately only when it already knows that actor's first or last dated event. Otherwise it delivers the relative-time event unchanged in the same batch; the timeline owns cross-batch redating.
+- **The gap:** Buffering an unresolved journal result inside the feed could lose it forever when no later activity arrived, violating the one-line-to-all-events boundary.
+- **The reach:** Snapshot/append convergence is judged through the timeline/model projection, while direct feed consumers receive every fact exactly once.
+- **Verdict:** sound — parsing preserves evidence and the existing timeline remains the sole owner of deferred presentation dating.
+- **Confidence:** high.
+
+### Content detection waits for a provider-positive record
+
+- **When:** Slice 05 (`codex-slice5`).
+- **The choice:** Portable detection skips malformed and unknown JSONL and validates provider-specific structure: a Codex `session_meta` needs a non-whitespace payload id; a Claude record needs its recognized envelope field and any identity must be non-whitespace. Valid ids are preserved rather than trimmed. If no positive discriminator exists, the legacy fallback remains Claude so empty or metadata-poor Claude uploads still open under the caller-supplied filename.
+- **The gap:** `type` spellings alone can collide with unrelated JSONL; for example, a wrong-shaped `user` record can precede a valid Codex header.
+- **The reach:** Noise cannot steal a Codex thread's identity, while existing Claude browser uploads retain their permissive fallback.
+- **Verdict:** sound — a provider claim needs positive evidence, and the fallback preserves established input behavior without fabricating Codex identity.
+- **Confidence:** high.
 
 ### Replacement commits only after positive content and fresh family evidence
 

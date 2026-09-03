@@ -13,11 +13,29 @@ pub enum Provider {
     Codex,
 }
 
+impl Provider {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
+}
+
 /// Provider-qualified session identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionKey {
     pub provider: Provider,
     pub id: String,
+}
+
+impl SessionKey {
+    pub fn new(provider: Provider, id: impl Into<String>) -> Self {
+        Self {
+            provider,
+            id: id.into(),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -1,7 +1,8 @@
 //! Stateful adapter from Claude Code's private JSONL schema to session facts.
 //!
-//! The wire DTOs remain in [`crate::transcript`]. This module is their only
-//! semantic consumer: everything downstream sees [`SessionEvent`] values.
+//! The wire DTOs remain in the crate-private transcript module. This adapter is
+//! their only semantic consumer: everything downstream sees [`SessionEvent`]
+//! values.
 
 use std::collections::{HashMap, HashSet};
 
@@ -18,7 +19,7 @@ use crate::transcript::{
 };
 
 /// Meaning of one Claude-owned file inside a session manifest.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ClaudeFile {
     Root,
     Subagent {
@@ -575,6 +576,20 @@ mod tests {
                 .count(),
             2
         );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    EventKind::ToolStarted(tool)
+                        if matches!(
+                            tool.category,
+                            ToolCategory::AgentSpawn | ToolCategory::WorkflowSpawn
+                        )
+                ))
+                .count(),
+            1
+        );
         assert!(events.iter().any(|event| matches!(
             &event.kind,
             EventKind::ToolFinished(ToolFinish {
@@ -582,5 +597,106 @@ mod tests {
                 ..
             })
         )));
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            EventKind::UsageObserved(usage) if usage.output_tokens == Some(12)
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            EventKind::SessionInfo(info) if info.title.as_deref() == Some("Dependency map")
+        )));
+    }
+
+    fn decoded_tool_summary(
+        name: &str,
+        input: serde_json::Value,
+        cwd: Option<&str>,
+    ) -> Option<String> {
+        let mut decoder = ClaudeDecoder::new(
+            SessionKey::new(Provider::Claude, "summary-test"),
+            ClaudeFile::Root,
+        );
+        let line = serde_json::json!({
+            "type": "assistant",
+            "uuid": "tool-line",
+            "cwd": cwd,
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "tool-1",
+                    "name": name,
+                    "input": input,
+                }],
+            },
+        })
+        .to_string();
+        decoder.decode_line(&line).into_iter().find_map(|event| {
+            if let EventKind::ToolStarted(tool) = event.kind {
+                tool.summary
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn tool_summaries_relativize_paths_and_leave_other_tools_readable() {
+        assert_eq!(
+            decoded_tool_summary(
+                "Edit",
+                serde_json::json!({ "file_path": "/proj/src/main.rs" }),
+                Some("/proj")
+            )
+            .as_deref(),
+            Some("src/main.rs")
+        );
+        assert_eq!(
+            decoded_tool_summary(
+                "Read",
+                serde_json::json!({ "file_path": "/other/x.rs" }),
+                Some("/proj")
+            )
+            .as_deref(),
+            Some("/other/x.rs")
+        );
+        assert_eq!(
+            decoded_tool_summary(
+                "Bash",
+                serde_json::json!({ "command": "cargo test" }),
+                Some("/proj")
+            )
+            .as_deref(),
+            Some("cargo test")
+        );
+    }
+
+    #[test]
+    fn tool_paths_strip_cwd_only_at_a_component_boundary() {
+        let summary = |path: &str, cwd: &str| {
+            decoded_tool_summary("Read", serde_json::json!({ "file_path": path }), Some(cwd))
+        };
+        assert_eq!(
+            summary(
+                "/Users/me/projects/zoetrope/src/a.rs",
+                "/Users/me/projects/zoetrope"
+            )
+            .as_deref(),
+            Some("src/a.rs")
+        );
+        assert_eq!(
+            summary(
+                "/Users/me/projects/zoetrope-web/src/a.rs",
+                "/Users/me/projects/zoetrope"
+            )
+            .as_deref(),
+            Some("/Users/me/projects/zoetrope-web/src/a.rs")
+        );
+        assert_eq!(
+            summary("/project/x.rs", "/proj").as_deref(),
+            Some("/project/x.rs")
+        );
+        assert_eq!(summary("/proj/x.rs", "/proj/").as_deref(), Some("x.rs"));
+        assert_eq!(summary("/proj", "/proj").as_deref(), Some("/proj"));
     }
 }

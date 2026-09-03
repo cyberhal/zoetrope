@@ -439,6 +439,13 @@ mod tests {
     use crate::state::session::SessionModel;
     use crate::transcript::SubagentMeta;
 
+    fn apply_meta(model: &mut SessionModel, agent_id: &str, meta: &SubagentMeta) {
+        let session = model.session.clone();
+        for event in crate::test_support::metadata_events(&session, agent_id, None, meta) {
+            model.apply_event(&event);
+        }
+    }
+
     /// A model with one subagent carrying `n` tool calls.
     fn model_with_tools(n: usize) -> SessionModel {
         let mut m = SessionModel::new("s1".into());
@@ -448,7 +455,7 @@ mod tests {
             tool_use_id: Some("t1".into()),
             stopped_by_user: None,
         };
-        m.apply_meta("sub1", None, &meta);
+        apply_meta(&mut m, "sub1", &meta);
         let agent = m.agents.get_mut("sub1").unwrap();
         for i in 0..n {
             agent.tool_calls.push(crate::state::session::ToolCallInfo {
@@ -474,7 +481,7 @@ mod tests {
             tool_use_id: Some("t1".into()),
             stopped_by_user: None,
         };
-        m.apply_meta("sub1", None, &meta);
+        apply_meta(&mut m, "sub1", &meta);
         let agent = m.agents.get_mut("sub1").unwrap();
         for (i, name) in names.iter().enumerate() {
             agent.tool_calls.push(crate::state::session::ToolCallInfo {

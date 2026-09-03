@@ -28,10 +28,7 @@ use wasm_bindgen::prelude::*;
 use web_time::Instant;
 
 use zoetrope::state::{App, Camera, Mode};
-use zoetrope::tailer::{
-    DemoSubagent, Source, UiEvent, Update, replay_from_jsonl, replay_from_session,
-};
-use zoetrope::transcript::{SubagentMeta, parse_line};
+use zoetrope::tailer::{ClaudeSessionFile, SessionFeed, UiEvent, replay_from_session};
 
 /// The demo session's main transcript, compiled into the wasm binary.
 const DEMO_MAIN: &str = include_str!("../../../assets/demo.jsonl");
@@ -41,7 +38,7 @@ const DEMO_SPEED: f64 = 8.0;
 /// Bind a subagent's `agent-<id>` stem to its embedded meta + transcript.
 macro_rules! demo_subagent {
     ($id:literal) => {
-        DemoSubagent {
+        ClaudeSessionFile {
             agent_id: $id,
             meta: include_str!(concat!(
                 "../../../assets/demo/subagents/agent-",
@@ -62,7 +59,7 @@ macro_rules! demo_subagent {
 /// Same, for a subagent under `assets/demo/subagents/workflows/<wf>/`.
 macro_rules! demo_workflow_subagent {
     ($wf:literal, $id:literal) => {
-        DemoSubagent {
+        ClaudeSessionFile {
             agent_id: $id,
             meta: include_str!(concat!(
                 "../../../assets/demo/subagents/workflows/",
@@ -84,10 +81,10 @@ macro_rules! demo_workflow_subagent {
     };
 }
 
-/// The workflow's `journal.jsonl` — no meta, folds under `Source::Journal`.
+/// The workflow's `journal.jsonl` — no meta, decoded as workflow lifecycle.
 macro_rules! demo_workflow_journal {
     ($wf:literal) => {
-        DemoSubagent {
+        ClaudeSessionFile {
             agent_id: "",
             meta: "",
             transcript: include_str!(concat!(
@@ -104,11 +101,6 @@ macro_rules! demo_workflow_journal {
 const CONTAINER: &str = "terminal-container";
 /// Rows moved per PageUp/PageDown in the detail panel.
 const PAGE_SCROLL: i32 = 10;
-/// Session id used for every user-loaded session. Loads replace the whole `App`,
-/// and live appends are stamped with the App's own id, so a single constant is
-/// enough (there is only ever one session in the page at a time).
-const LOADED_SESSION_ID: &str = "session";
-
 thread_local! {
     /// The live `App`, shared with the render loop. `main` stashes the same `Rc`
     /// the `draw_web` closure holds, so the JS-callable loaders below can swap the
@@ -116,6 +108,8 @@ thread_local! {
     /// next animation frame renders the change. wasm is single-threaded, so these
     /// calls never interleave with a frame mid-borrow.
     static APP: RefCell<Option<Rc<RefCell<App>>>> = const { RefCell::new(None) };
+    /// Provider decoder state corresponding to the currently loaded app.
+    static FEED: RefCell<Option<SessionFeed>> = const { RefCell::new(None) };
 }
 
 fn main() -> io::Result<()> {
@@ -132,14 +126,15 @@ fn main() -> io::Result<()> {
         demo_workflow_subagent!("wf_demo01", "w2000000000000002"),
         demo_workflow_journal!("wf_demo01"),
     ];
-    let (items, info) = replay_from_session(DEMO_MAIN, &subagents);
-    let mut app = App::new("demo".to_string(), Mode::Replay);
+    let decoded = replay_from_session(DEMO_MAIN, &subagents, "demo");
+    let mut app = App::new(decoded.session.clone(), Mode::Replay);
     app.handle_ui_event(UiEvent::ReplayLoaded {
-        session_id: "demo".to_string(),
-        items,
+        session: decoded.session,
+        items: decoded.items,
         speed: DEMO_SPEED,
-        info,
+        info: decoded.info,
     });
+    FEED.with(|cell| *cell.borrow_mut() = Some(decoded.feed));
 
     let app = Rc::new(RefCell::new(app));
     // Stash the shared handle so the JS-callable loaders (`zoetrope_load` /
@@ -242,11 +237,11 @@ fn main() -> io::Result<()> {
 // native app and the demo use.
 // ---------------------------------------------------------------------------
 
-/// One subagent's embedded files, as passed from JS. Mirrors [`DemoSubagent`]
-/// but owns its strings (deserialized from the JS-side JSON). For an append,
-/// `meta` is `""` once already sent and `transcript` carries only new bytes.
+/// One Claude sidecar, as passed from JS. Mirrors [`ClaudeSessionFile`] but
+/// owns its strings (deserialized from the JS-side JSON). For an append, `meta`
+/// is `""` once already sent and `transcript` carries only new bytes.
 #[derive(serde::Deserialize, Default)]
-struct OwnedSub {
+struct OwnedClaudeFile {
     #[serde(default)]
     agent_id: String,
     #[serde(default)]
@@ -265,7 +260,7 @@ struct OwnedSub {
 /// Parse the JS-side `[{agent_id, meta, transcript}, …]` payload, tolerating an
 /// empty string (no subagents) and malformed JSON (→ none) rather than panicking
 /// across the wasm boundary.
-fn parse_subs(json: &str) -> Vec<OwnedSub> {
+fn parse_claude_files(json: &str) -> Vec<OwnedClaudeFile> {
     if json.trim().is_empty() {
         return Vec::new();
     }
@@ -277,11 +272,16 @@ fn parse_subs(json: &str) -> Vec<OwnedSub> {
 /// is the (possibly empty) sidecar payload. `live` opens it at the edge in live
 /// mode (ready for [`zoetrope_append`]) instead of replaying paced from the start.
 #[wasm_bindgen]
-pub fn zoetrope_load(main_text: String, subagents_json: String, live: bool) {
-    let subs = parse_subs(&subagents_json);
-    let sub_refs: Vec<DemoSubagent> = subs
+pub fn zoetrope_load(
+    main_text: String,
+    subagents_json: String,
+    live: bool,
+    claude_session_id: String,
+) {
+    let subs = parse_claude_files(&subagents_json);
+    let sub_refs: Vec<ClaudeSessionFile> = subs
         .iter()
-        .map(|s| DemoSubagent {
+        .map(|s| ClaudeSessionFile {
             agent_id: &s.agent_id,
             meta: &s.meta,
             transcript: &s.transcript,
@@ -289,20 +289,17 @@ pub fn zoetrope_load(main_text: String, subagents_json: String, live: bool) {
             journal: s.journal,
         })
         .collect();
-    let (items, info) = if sub_refs.is_empty() {
-        replay_from_jsonl(&main_text)
-    } else {
-        replay_from_session(&main_text, &sub_refs)
-    };
+    let decoded = replay_from_session(&main_text, &sub_refs, &claude_session_id);
 
     let mode = if live { Mode::Live } else { Mode::Replay };
-    let mut next = App::new(LOADED_SESSION_ID.to_string(), mode);
+    let mut next = App::new(decoded.session.clone(), mode);
     next.handle_ui_event(UiEvent::ReplayLoaded {
-        session_id: LOADED_SESSION_ID.to_string(),
-        items,
+        session: decoded.session,
+        items: decoded.items,
         speed: DEMO_SPEED,
-        info,
+        info: decoded.info,
     });
+    FEED.with(|cell| *cell.borrow_mut() = Some(decoded.feed));
 
     APP.with(|cell| {
         if let Some(rc) = cell.borrow().as_ref() {
@@ -318,72 +315,31 @@ pub fn zoetrope_load(main_text: String, subagents_json: String, live: bool) {
 /// seen). Folds onto the edge when following — a no-op if nothing parses.
 #[wasm_bindgen]
 pub fn zoetrope_append(main_tail: String, subagents_json: String) {
-    let mut updates: Vec<Update> = Vec::new();
-    for line in main_tail.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Some(entry) = parse_line(line) {
-            updates.push(Update::Entry {
-                source: Source::Main,
-                entry,
-            });
-        }
-    }
-    for sub in parse_subs(&subagents_json) {
-        // A workflow journal carries no meta and folds under its own source —
-        // mirrors `Source::Journal` in the native tailer. Skip one with no
-        // workflow id: there is nothing to attribute it to.
-        if sub.journal {
-            let Some(wf) = sub.workflow.clone() else {
-                continue;
-            };
-            for line in sub.transcript.lines() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                if let Some(entry) = parse_line(line) {
-                    updates.push(Update::Entry {
-                        source: Source::Journal(wf.clone()),
-                        entry,
-                    });
-                }
-            }
-            continue;
-        }
-        if !sub.meta.trim().is_empty()
-            && let Ok(meta) = serde_json::from_str::<SubagentMeta>(&sub.meta)
-        {
-            updates.push(Update::SubagentMeta {
-                agent_id: sub.agent_id.clone(),
-                workflow: sub.workflow.clone(),
-                meta,
-            });
-        }
-        for line in sub.transcript.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Some(entry) = parse_line(line) {
-                updates.push(Update::Entry {
-                    source: Source::Sub(sub.agent_id.clone()),
-                    entry,
-                });
-            }
-        }
-    }
-
-    if updates.is_empty() {
+    let subs = parse_claude_files(&subagents_json);
+    let sub_refs: Vec<ClaudeSessionFile<'_>> = subs
+        .iter()
+        .map(|sub| ClaudeSessionFile {
+            agent_id: &sub.agent_id,
+            meta: &sub.meta,
+            transcript: &sub.transcript,
+            workflow: sub.workflow.as_deref(),
+            journal: sub.journal,
+        })
+        .collect();
+    let events = FEED.with(|cell| {
+        cell.borrow_mut()
+            .as_mut()
+            .and_then(|feed| feed.append_claude(&main_tail, &sub_refs))
+            .unwrap_or_default()
+    });
+    if events.is_empty() {
         return;
     }
     APP.with(|cell| {
         if let Some(rc) = cell.borrow().as_ref() {
             let mut app = rc.borrow_mut();
-            let session_id = app.current_session_id.clone();
-            app.handle_ui_event(UiEvent::Batch {
-                session_id,
-                updates,
-            });
+            let session = app.current_session.clone();
+            app.handle_ui_event(UiEvent::Batch { session, events });
         }
     });
 }

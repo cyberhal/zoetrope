@@ -19,8 +19,16 @@ zoe inspect <file.jsonl>     print the session tree and exit (no TUI)
 ```
 
 A **file** target bulk-loads then tails it; a **directory** (or none → the current
-project) discovers the latest session and follows it live. `--follow` only changes
+project) discovers the latest eligible Claude Code or Codex session and follows it
+live. `--follow` only changes
 where the playhead starts (the live edge instead of the beginning).
+
+| Entry point | Claude Code | Codex |
+| --- | --- | --- |
+| Native file / `inspect` | replay, inspect, follow | replay, inspect, follow |
+| Native cwd discovery | newest eligible session, live | newest eligible session, live |
+| Browser drag-and-drop | main plus optional sidecar family | one static rollout JSONL |
+| Browser Sessions picker | browse folders; live in Chromium | not supported |
 
 ## Launching (browser)
 
@@ -30,17 +38,18 @@ The [browser app](/app) boots into a bundled demo. To watch your own session:
   projects, pick one, and follow it live. zoetrope reads the main transcript plus its
   subagents, then tails the folder for new activity. This is the same "follow a
   running session" flow as the native app, built on the File System Access API.
-  Nothing is uploaded.
+  Selected transcript bytes are parsed locally and are not uploaded.
 - **Sessions** (other browsers): the same button falls back to a folder picker,
   so browsing and replaying work everywhere. **Following live does not** — without
   the File System Access API the browser hands over an immutable *snapshot* of
   each file, so writes that happen after you pick never arrive. The picker says
   so before you choose. Live-follow needs Chrome or Edge (or the native TUI).
 - **Drag and drop** a `.jsonl` transcript (any browser). A drop carries only what
-  you dropped, and nothing in a transcript points at its sidecar files — so drag
-  the `<uuid>.jsonl` **and** its `<uuid>/` folder together to get subagents and
-  workflows. Drop the transcript alone and you get the main agent only; zoetrope
-  will say so rather than pretending the session had no subagents.
+  you dropped. For Claude, drag the `<uuid>.jsonl` **and** its `<uuid>/` folder
+  together to include subagents and workflows; the transcript alone shows only
+  the main agent. For Codex, drop one rollout JSONL for a static replay. Codex
+  directory browsing, child-file collection, and browser live-follow are not
+  supported.
 
 ## Keys
 

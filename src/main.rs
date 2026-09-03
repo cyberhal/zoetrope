@@ -51,7 +51,7 @@ pub enum Cli {
 const DEFAULT_REPLAY_SPEED: f64 = 8.0;
 
 const USAGE: &str = "\
-zoetrope — visualize coding-agent sessions as a flow graph
+zoetrope — visualize Claude Code and Codex sessions as a flow graph
 
 USAGE:
     zoe                     follow the current project's live session

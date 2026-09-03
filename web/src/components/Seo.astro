@@ -19,7 +19,7 @@ const canonical = Astro.site
 const ogImage = Astro.site ? new URL("/og.png", Astro.site).href : undefined;
 
 const IMAGE_ALT =
-  "The zoetrope terminal UI: a Claude Code session drawn as a flow graph of agent nodes, with a prompt timeline along the bottom.";
+  "The zoetrope terminal UI: a coding-agent session drawn as a flow graph of agent nodes, with a prompt timeline along the bottom.";
 ---
 
 {canonical && <link rel="canonical" href={canonical} />}

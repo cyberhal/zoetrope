@@ -95,7 +95,9 @@ You'll need the `wasm32-unknown-unknown` target (`rustup target add wasm32-unkno
 and `trunk` (`cargo install trunk`). `pnpm build:wasm` (that is,
 `bash scripts/build-wasm.sh`) builds only the wasm; lint it from the repo root
 with `cd web/wasm && cargo clippy` — that crate's `.cargo/config.toml` defaults the
-target to wasm32, so no flags are needed.
+target to wasm32, so no flags are needed. The browser crate follows stable Rust
+and currently declares Rust 1.90 because its renderer requires it; the native
+crate keeps its separate Rust 1.88 MSRV.
 
 ## Status
 

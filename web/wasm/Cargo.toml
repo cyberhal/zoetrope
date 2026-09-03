@@ -16,7 +16,8 @@ name = "zoetrope-web"
 # (`zoetrope::VERSION`), not this one.
 version = "0.0.0"
 edition = "2024"
-description = "Browser frontend for zoetrope — the Claude Code session visualizer."
+rust-version = "1.90"
+description = "Browser frontend for zoetrope — visualize Claude Code and Codex sessions."
 license = "MIT"
 publish = false
 

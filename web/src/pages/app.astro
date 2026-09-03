@@ -21,12 +21,12 @@ const wasmBase = '/wasm';
     <title>zoetrope — browser app</title>
     <meta
       name="description"
-      content="Run zoetrope in your browser: replay a Claude Code session transcript as a live flow graph, fully locally."
+      content="Replay a Claude Code session family or a single Codex rollout JSONL locally in your browser."
     />
     <Schema />
     <Seo
       title="zoetrope — browser app"
-      description="Run zoetrope in your browser: replay a Claude Code session transcript as a live flow graph, fully locally."
+      description="Replay a Claude Code session family or a single Codex rollout JSONL locally in your browser."
     />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <!-- Same self-hosted brand fonts as the landing (Space Mono for the wordmark,
@@ -446,7 +446,7 @@ const wasmBase = '/wasm';
       <span id="status" class="statusbar">loading wasm…</span>
       <span class="spacer"></span>
 
-      <button id="open-folder" class="act primary" title="Browse your Claude sessions and replay or follow one live.">
+      <button id="open-folder" class="act primary" title="Browse Claude sessions and replay or follow one live.">
         Sessions
       </button>
       <input id="dir-input" type="file" webkitdirectory hidden />
@@ -458,7 +458,7 @@ const wasmBase = '/wasm';
 
     <div id="terminal-container"></div>
 
-    <div id="drop" class="drop">Drop a session's &lt;uuid&gt;.jsonl here (with its &lt;uuid&gt;/ folder for subagents) to replay it, or use “Sessions” to browse your Claude projects.</div>
+    <div id="drop" class="drop">Drop a Claude &lt;uuid&gt;.jsonl with its sidecar folder, or one Codex rollout JSONL. “Sessions” browses Claude projects.</div>
 
     <!-- Small-screen heads-up: the graph is dense and needs a mouse/keyboard.
          Dismissable, so a curious phone visitor can still watch the replay. -->
@@ -610,10 +610,6 @@ const wasmBase = '/wasm';
         }
       }
 
-      // Spawn tool calls in a main transcript (`Task` is the legacy name for
-      // `Agent`). Only used to decide whether to hint about missing sidecars.
-      const SPAWNS_RE = /"name":"(?:Agent|Task|Workflow)"/;
-
       async function loadFiles(fileList) {
         if (!ready) return;
         const files = Array.from(fileList);
@@ -624,16 +620,13 @@ const wasmBase = '/wasm';
           return;
         }
         stopLive();
-        zoetrope_load(mainText, JSON.stringify(subs), false);
+        zoetrope_load(mainText, JSON.stringify(subs), false, mainName.replace(/\.jsonl$/i, ''));
         const n = subs.length;
-        // A drop only carries what was dropped: there is no reference to follow
-        // from a transcript to its sidecars. So a main file that spawned agents
-        // with no subagent files alongside it means the `<uuid>/` folder was left
-        // behind — an easy mistake that otherwise renders as a lone main agent
-        // with nothing to say it is incomplete.
-        if (!n && SPAWNS_RE.test(mainText)) {
+        // A drop only carries what was dropped. With no sidecars this is either
+        // the complete supported Codex shape or a Claude main-only view.
+        if (!n) {
           setStatus(
-            `replaying ${mainName} · main agent only — drop its <uuid>/ folder too to see the subagents it spawned`,
+            `replaying ${mainName} · single JSONL (Codex rollout or Claude main-only)`,
           );
         } else {
           setStatus(`replaying ${mainName} · ${n} subagent${n === 1 ? '' : 's'}`);
@@ -1039,7 +1032,7 @@ const wasmBase = '/wasm';
             for (const [wfId, f] of Object.entries(s.journalFiles ?? {})) {
               subs.push({ agent_id: '', meta: '', transcript: await f.text(), workflow: wfId, journal: true });
             }
-            zoetrope_load(await s.mainFile.text(), JSON.stringify(subs), false);
+            zoetrope_load(await s.mainFile.text(), JSON.stringify(subs), false, s.uuid);
             setStatus(`replaying ${label} · ${subs.length} subagent${subs.length === 1 ? '' : 's'}`);
             return;
           }
@@ -1068,7 +1061,7 @@ const wasmBase = '/wasm';
               }
               await pushWorkflowPayload(await indexWorkflows(subagentsDir), subsInit, state);
             }
-            zoetrope_load(m.fresh, JSON.stringify(subsInit), true);
+            zoetrope_load(m.fresh, JSON.stringify(subsInit), true, s.uuid);
             liveState = state;
             setStatus(`live · ${label} · ${subsInit.length} subagent${subsInit.length === 1 ? '' : 's'}`, false, true);
             liveTimer = setTimeout(pollLive, 1000);
@@ -1083,7 +1076,7 @@ const wasmBase = '/wasm';
               }
               await pushWorkflowPayload(await indexWorkflows(subagentsDir), subs, null);
             }
-            zoetrope_load(mainText, JSON.stringify(subs), false);
+            zoetrope_load(mainText, JSON.stringify(subs), false, s.uuid);
             setStatus(`replaying ${label} · ${subs.length} subagent${subs.length === 1 ? '' : 's'}`);
           }
         } catch (e) {

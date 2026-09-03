@@ -167,7 +167,7 @@ jobs:
           mkdir -p Formula
           cat > Formula/zoetrope.rb <<EOF
           class Zoetrope < Formula
-            desc "Watch a Claude Code session as a live flow graph"
+            desc "Watch Claude Code and Codex sessions as live flow graphs"
             homepage "https://github.com/furkankly/zoetrope"
             version "${VERSION}"
             license "MIT"

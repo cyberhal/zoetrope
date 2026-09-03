@@ -540,8 +540,8 @@ mod tests {
 
     #[test]
     fn tool_list_lines_counts_era_headers() {
+        use crate::formats::claude::ClaudeFile;
         use crate::state::session::{SessionModel, ToolCallInfo, ToolState};
-        use crate::tailer::{Source, Update};
         use crate::transcript::parse_line;
 
         let mut m = SessionModel::new("s".into());
@@ -552,10 +552,13 @@ mod tests {
             let line = format!(
                 r#"{{"type":"user","uuid":"{uid}","parentUuid":null,"origin":{{"kind":"human"}},"timestamp":"{ts}","message":{{"role":"user","content":"{text}"}}}}"#
             );
-            m.apply_update(&Update::Entry {
-                source: Source::Main,
-                entry: parse_line(&line).unwrap(),
-            });
+            for event in crate::test_support::claude_events(
+                &crate::event::SessionKey::from("s"),
+                ClaudeFile::Root,
+                parse_line(&line).unwrap(),
+            ) {
+                m.apply_event(&event);
+            }
         }
         let agent = m.agents.get_mut(crate::state::session::MAIN_ID).unwrap();
         for (i, ts) in [

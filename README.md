@@ -5,7 +5,7 @@
 <h1 align="center">zoetrope</h1>
 
 <p align="center">
-  <em>Watch a Claude Code session as a live flow graph, in your terminal or your browser.</em>
+  <em>Watch Claude Code and Codex sessions as live flow graphs.</em>
 </p>
 
 <p align="center">
@@ -24,11 +24,10 @@
   <img src="https://raw.githubusercontent.com/furkankly/zoetrope/main/assets/zoetrope.svg" alt="A session drawn as a flow graph: a main agent above the subagents it spawned, over a timeline of tool activity" width="620">
 </p>
 
-Claude Code writes a JSONL transcript for every session under `~/.claude/projects/`.
-zoetrope reads it and draws the session as a graph in your terminal: the main agent, the subagents and
-workflows it spawns, and the tools each one runs, updating live as it goes. Point it
-at a finished run and it replays, paced by the session's own timestamps. Point it at a
-running one and it follows along. It's read-only, and nothing leaves your machine.
+Claude Code and Codex write local JSONL session logs. zoetrope reads them and draws
+the main agent, spawned agents, workflows, and tools as a graph. The native app can
+discover, replay, inspect, and live-follow both providers. It is read-only; transcript
+content is parsed locally and is never uploaded.
 
 Built on [ratatui](https://ratatui.rs) and [rataflow](https://github.com/furkankly/rataflow).
 
@@ -81,9 +80,10 @@ Give it a directory, or no argument at all, and it finds the newest session in t
 project and follows it live. Whichever way you start, the controls are the same:
 scrub, follow, pause, jump back to live.
 
-The same engine also runs [in the browser](https://zoetrope.furkankly.dev/app),
-compiled to WebAssembly via [ratzilla](https://github.com/ratatui/ratzilla). Open a
-session from disk, or drop a transcript on the page. It stays local there too.
+The same engine also runs [in the browser](https://zoetrope.furkankly.dev/app).
+Drag in a Claude session family or one static Codex rollout JSONL. The browser's
+Sessions picker and live folder following remain Claude-only. See the
+[usage guide](https://zoetrope.furkankly.dev/guides/usage/) for the precise matrix.
 
 ## Features
 
@@ -115,9 +115,9 @@ session from disk, or drop a transcript on the page. It stays local there too.
 - Follows a running session live, or replays a finished one
 - Reads everything a session writes: the main transcript, its subagents, and
   workflows with their own children, so the graph is the whole picture
-- Keeps going when Claude Code writes something it hasn't seen: unfamiliar records
+- Keeps going when a provider writes something it hasn't seen: unfamiliar records
   are skipped, never fatal
-- Read-only, and no network at all (see below)
+- Read-only; transcript data is never uploaded
 
 ## Keys
 
@@ -163,45 +163,22 @@ scrubber to travel back through the session.
 
 ## Under the Hood
 
-zoetrope treats the transcript as an **append-only event log**. It tails the files,
-parses each line defensively, and folds them into a derived model of agents, tool
-calls, and prompts. Nothing is mutated in place. The model is a pure function of the
-facts seen so far, so seeking backwards is exact.
+Provider adapters normalize private JSONL schemas into one event stream. The model
+fold is order-independent, live and replay share one timeline, and decoder state
+travels with each file from snapshot into tailing. The portable core has no IO; the
+native and browser frontends only supply bytes and events.
 
-A few of the pieces that turn a log into a watchable session:
-
-- **Two clocks, kept apart.** Content time comes from the transcript's own timestamps;
-  presentation time is the playhead you control. Every pacing decision (speed, gap
-  compression, scrubbing) touches only the second one, so no display choice can ever
-  alter what the session says happened.
-- **One timeline for live and replay.** Behind the live edge it paces forward; at the
-  edge it pins and folds in new appends as they land. A live session and a saved
-  recording differ only in where the playhead starts. Same engine, same controls.
-- **Ground truth over heuristics.** Parentage, completion and naming come from what the
-  format actually records (a subagent's `toolUseId`, a workflow's `runId`, a journal
-  `result`) rather than from guessing at strings or timing.
-- **You own the camera, not the history.** The recording is immutable and the graph
-  never rearranges itself under you (`r` to relayout). The camera follows the action
-  until you touch it, then stays where you put it.
-- **Zero network, provably.** There is no HTTP client anywhere in the dependency tree,
-  and `tokio` is pulled in without its `net` feature. `cargo tree` is the proof. This is
-  a property you can check, not a promise.
-
-The model, the timeline and the rendering all live in the **portable core**, a
-library with no IO that compiles for any target, including WebAssembly. The native
-frontend (the `zoe` binary in this
-crate) and the browser frontend (the `zoetrope-web` crate under `web/wasm/`, which
-runs the hosted app) sit on top of it and differ only in their IO and event loop.
-
-See [`docs/DESIGN.md`](https://github.com/furkankly/zoetrope/blob/main/docs/DESIGN.md) for the module map and the transcript format,
-and [`docs/ARCHITECTURE.md`](https://github.com/furkankly/zoetrope/blob/main/docs/ARCHITECTURE.md) for the invariants above in full.
+The durable invariants live in
+[`docs/ARCHITECTURE.md`](https://github.com/furkankly/zoetrope/blob/main/docs/ARCHITECTURE.md),
+with a short ownership map in
+[`docs/DESIGN.md`](https://github.com/furkankly/zoetrope/blob/main/docs/DESIGN.md).
 
 ## A note on the transcript format
 
-The JSONL format zoetrope reads is undocumented and internal to Claude Code, so it can
+The JSONL formats zoetrope reads are undocumented provider internals, so they can
 change without warning. zoetrope is built to degrade rather than break: unrecognized
 records are skipped, missing fields fall back, and a malformed line never takes down
-the session. If a new Claude Code release makes something render oddly, please
+the session. If a provider release makes something render oddly, please
 [open an issue](https://github.com/furkankly/zoetrope/issues).
 
 ## Contributing
@@ -210,9 +187,10 @@ Pull requests are welcome.
 
 - This project follows [Conventional Commits](https://www.conventionalcommits.org/) for all commit messages (e.g. `feat(timeline): index the playhead by event instead of wall-clock`, `fix(tailer): fold appends at the live edge without rebuilding`). The changelog is generated from them with [git-cliff](https://github.com/orhun/git-cliff), and non-conforming commits are dropped.
 - Run `cargo fmt`, `cargo clippy` and `cargo test` before opening a PR.
-- Those cover the portable core and the native frontend. The browser frontend is a
+- Those cover the Rust 1.88 portable core and native frontend. The browser frontend is a
   second crate (`zoetrope-web`, in `web/wasm/`) that only builds for wasm32, so it is
-  excluded from the root workspace and no root `cargo` command touches it. From the
+  excluded from the root workspace and follows stable Rust (currently Rust 1.90+
+  because of its renderer). From the
   repo root, build it with `bash web/scripts/build-wasm.sh` and lint it with
   `cd web/wasm && cargo clippy` (its `.cargo/config.toml` defaults the target to wasm32).
 

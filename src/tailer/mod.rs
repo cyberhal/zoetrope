@@ -19,9 +19,6 @@ use tokio::sync::mpsc;
 
 use crate::event::{SessionEvent, SessionKey};
 
-#[cfg(test)]
-use crate::transcript::{Entry, SubagentMeta};
-
 // Portable: the timeline item + its ordering (no IO → compiles on wasm).
 pub(crate) mod item;
 pub use item::ReplayItem;
@@ -29,7 +26,9 @@ pub(crate) use item::Timing;
 #[cfg(test)]
 pub(crate) use item::date_and_sort;
 pub(crate) use item::date_and_sort_live;
-pub use item::{DemoSubagent, replay_from_jsonl, replay_from_session};
+pub use item::{
+    ClaudeSessionFile, DecodedSession, SessionFeed, replay_from_jsonl, replay_from_session,
+};
 
 // Native-only feeders: incremental byte reading, live polling, replay assembly —
 // they pull tokio + the filesystem, so the `native` feature gates them out of the
@@ -81,31 +80,6 @@ pub enum UiEvent {
     SessionReset { session: SessionKey },
     /// A non-fatal error string for display.
     Error(String),
-}
-
-/// Claude-shaped fixture input retained only so the pre-cutover behavior tests
-/// exercise the real adapter before reaching neutral consumers.
-#[cfg(test)]
-#[derive(Debug, Clone)]
-pub(crate) enum Update {
-    Entry {
-        source: Source,
-        entry: Entry,
-    },
-    SubagentMeta {
-        agent_id: String,
-        workflow: Option<String>,
-        meta: SubagentMeta,
-    },
-    Event(SessionEvent),
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum Source {
-    Main,
-    Sub(String),
-    Journal(String),
 }
 
 // ---------------------------------------------------------------------------

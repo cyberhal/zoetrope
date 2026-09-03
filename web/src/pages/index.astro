@@ -24,12 +24,12 @@ const KEYS_URL = '/guides/usage/';
     <title>zoetrope — watch your agents work</title>
     <meta
       name="description"
-      content="A terminal UI that visualizes Claude Code agent sessions as a live flow graph — replay a finished transcript or follow a running one. Zero network IO; nothing leaves your machine."
+      content="Visualize Claude Code and Codex sessions as live flow graphs — discover, replay, inspect, or follow local JSONL sessions."
     />
     <Schema />
     <Seo
       title="zoetrope — watch your agents work"
-      description="A terminal UI that visualizes Claude Code agent sessions as a live flow graph — replay a finished transcript or follow a running one. Zero network IO; nothing leaves your machine."
+      description="Visualize Claude Code and Codex sessions as live flow graphs — discover, replay, inspect, or follow local JSONL sessions."
     />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <Font cssVariable="--font-mono" preload />
@@ -83,7 +83,7 @@ const KEYS_URL = '/guides/usage/';
         <div class="pitch">
           <h1>watch your<br />agents <em>work.</em></h1>
           <p class="sub">
-            Claude Code writes a JSONL log for every session. zoetrope reads it and
+            Claude Code and Codex write local JSONL session logs. zoetrope reads them and
             lays the session out as a graph: which agents ran, and what each one is
             doing. Watch a live session, or replay a finished one.
           </p>
@@ -91,7 +91,7 @@ const KEYS_URL = '/guides/usage/';
             <a class="btn primary" href="/app">▸ try it in your browser</a>
             <a class="btn ghost" href={DOCS_URL}>install the TUI</a>
           </div>
-          <p class="fineprint">reads the JSONL Claude Code already writes · runs fully local.</p>
+          <p class="fineprint">read-only · transcript content is parsed locally and never uploaded.</p>
         </div>
       </section>
 

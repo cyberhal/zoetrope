@@ -4,18 +4,19 @@ Add first-class Codex session support without weakening Zoetrope's existing Clau
 
 ## Next Agent Prompt
 
-Status: Slices 01–03 are integrated on `main` at `ee3027b`; Slice 04 is complete
-and independently reviewed on `codex-slice4`, pending integration. Last updated
+Status: Slices 01–04 are integrated on `main` at `f200442`; Slice 05 is complete
+and independently reviewed on `codex-slice5`, pending integration. Last updated
 2026-09-04.
 
-After integrating Slice 04, begin with
-[Slice 05](slices/05-browser-docs-and-integration.md). Live following now keeps
+Integrate [Slice 05](slices/05-browser-docs-and-integration.md), then run the
+feature-wide integration review and closeout without archiving this spec first.
+Portable replay now preserves the actual provider-qualified session key and
+stateful per-file decoders for browser appends. Live following keeps
 one ordered tracker and decoder per manifest file, refreshes Codex families on
 a throttled cadence, and waits for positive replacement evidence on every
 changed file before reloading a fresh family manifest. Preserve the original
 `WatchTarget`, replay speed, parent-first family order, typed child completion
-policy, and exact-reference provenance joins. Complete the final slice, then
-run the feature-wide integration review and closeout.
+policy, and exact-reference provenance joins.
 
 Inherit these decisions:
 
@@ -39,8 +40,8 @@ Global checklist:
 - [x] [Slice 01](slices/01-normalized-events-and-codex-decoder.md): normalized events and stateful Codex decoder (`153706b`)
 - [x] [Slice 02](slices/02-session-catalog-and-manifests.md): bounded cross-provider discovery and manifests (`5579a88`)
 - [x] [Slice 03](slices/03-core-replay-and-inspect.md): cut the model, replay, and inspect over to normalized events (`ee3027b`)
-- [x] [Slice 04](slices/04-codex-families-and-live-follow.md): nested Codex families and live follow (`codex-slice4`, clean review, pending integration)
-- [ ] [Slice 05](slices/05-browser-docs-and-integration.md): browser floor, copy/docs, cleanup, and feature-wide review
+- [x] [Slice 04](slices/04-codex-families-and-live-follow.md): nested Codex families and live follow (`f200442`)
+- [x] [Slice 05](slices/05-browser-docs-and-integration.md): browser floor, copy/docs, cleanup, and clean slice review (`codex-slice5`)
 
 ## Outcome and observable behavior
 
@@ -115,5 +116,7 @@ The three planning drafts independently agreed on stateful per-file decoding, pr
 - Copied child prefixes contribute zero child activity.
 - Cross-provider cwd discovery chooses only eligible roots and is deterministic.
 - Replay-to-tail handoff, partial writes, rotation/truncation, backward seek, and live/bulk convergence remain exact.
-- Native all-target tests, portable no-default-features tests, wasm check/build, clippy, rustdoc, formatting, and packaging gates pass on Rust 1.88+.
+- Native all-target tests, portable no-default-features tests, clippy, rustdoc,
+  formatting, and packaging pass on Rust 1.88. The separate browser workspace
+  passes its wasm gates on stable Rust and currently declares Rust 1.90.
 - Dependency inspection confirms no network runtime was added.

@@ -257,6 +257,13 @@ mod tests {
     use super::*;
     use crate::transcript::SubagentMeta;
 
+    fn apply_meta(model: &mut SessionModel, agent_id: &str, meta: &SubagentMeta) {
+        let session = model.session.clone();
+        for event in crate::test_support::metadata_events(&session, agent_id, None, meta) {
+            model.apply_event(&event);
+        }
+    }
+
     /// A model with main + one direct subagent (running).
     fn model_with_subagent() -> SessionModel {
         let mut m = SessionModel::new("s1".into());
@@ -266,7 +273,7 @@ mod tests {
             tool_use_id: Some("ag1".into()),
             stopped_by_user: None,
         };
-        m.apply_meta("abc123", None, &meta);
+        apply_meta(&mut m, "abc123", &meta);
         m
     }
 
@@ -389,7 +396,7 @@ mod tests {
             tool_use_id: Some("ag2".into()),
             stopped_by_user: None,
         };
-        model.apply_meta("def456", None, &meta2);
+        apply_meta(&mut model, "def456", &meta2);
         let structural = sync(&mut flow, &model, false);
         assert!(structural);
 

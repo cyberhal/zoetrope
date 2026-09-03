@@ -8,28 +8,13 @@ use crate::event::{
     ActorId, AgentCompletionPolicy, AgentDescriptor, AgentRole, EventKind, EventTime, SessionEvent,
     SessionKey, SpawnProvenance,
 };
-use crate::formats::claude::{ClaudeDecoder, ClaudeFile, decode_subagent_metadata};
-use crate::formats::codex::CodexDecoder;
+use crate::formats::FileDecoder;
+use crate::formats::claude::{ClaudeFile, decode_subagent_metadata};
 use crate::session_catalog::SyntheticMetadataEvent;
 use crate::session_catalog::{ManifestFile, ManifestFileRole, SessionManifest};
 use crate::state::SessionInfo;
 use crate::tailer::ReplayItem;
 use crate::tailer::bytes::TailState;
-
-#[derive(Debug)]
-pub(crate) enum FileDecoder {
-    Claude(Box<ClaudeDecoder>),
-    Codex(Box<CodexDecoder>),
-}
-
-impl FileDecoder {
-    pub(crate) fn decode_line(&mut self, line: &str) -> Vec<SessionEvent> {
-        match self {
-            Self::Claude(decoder) => decoder.decode_line(line),
-            Self::Codex(decoder) => decoder.decode_line(line),
-        }
-    }
-}
 
 #[derive(Debug)]
 pub(crate) struct TrackedFile {
@@ -135,31 +120,26 @@ pub fn manifest_for_file(path: &Path) -> Option<SessionManifest> {
 pub(crate) fn decoder_for(manifest: &SessionManifest, file: &ManifestFile) -> Option<FileDecoder> {
     match &file.role {
         ManifestFileRole::Root => match manifest.root.key.provider {
-            crate::event::Provider::Claude => Some(FileDecoder::Claude(Box::new(
-                ClaudeDecoder::new(manifest.root.key.clone(), ClaudeFile::Root),
-            ))),
-            crate::event::Provider::Codex => {
-                Some(FileDecoder::Codex(Box::new(CodexDecoder::new())))
-            }
+            crate::event::Provider::Claude => Some(FileDecoder::claude(
+                manifest.root.key.clone(),
+                ClaudeFile::Root,
+            )),
+            crate::event::Provider::Codex => Some(FileDecoder::codex()),
         },
-        ManifestFileRole::Spawned => Some(FileDecoder::Codex(Box::new(CodexDecoder::new()))),
-        ManifestFileRole::ClaudeSubagent { agent_id, workflow } => {
-            Some(FileDecoder::Claude(Box::new(ClaudeDecoder::new(
-                manifest.root.key.clone(),
-                ClaudeFile::Subagent {
-                    agent_id: agent_id.clone(),
-                    workflow: workflow.clone(),
-                },
-            ))))
-        }
-        ManifestFileRole::ClaudeWorkflowJournal { workflow } => {
-            Some(FileDecoder::Claude(Box::new(ClaudeDecoder::new(
-                manifest.root.key.clone(),
-                ClaudeFile::WorkflowJournal {
-                    workflow: workflow.clone(),
-                },
-            ))))
-        }
+        ManifestFileRole::Spawned => Some(FileDecoder::codex()),
+        ManifestFileRole::ClaudeSubagent { agent_id, workflow } => Some(FileDecoder::claude(
+            manifest.root.key.clone(),
+            ClaudeFile::Subagent {
+                agent_id: agent_id.clone(),
+                workflow: workflow.clone(),
+            },
+        )),
+        ManifestFileRole::ClaudeWorkflowJournal { workflow } => Some(FileDecoder::claude(
+            manifest.root.key.clone(),
+            ClaudeFile::WorkflowJournal {
+                workflow: workflow.clone(),
+            },
+        )),
         ManifestFileRole::ClaudeSubagentMetadata { .. } => None,
     }
 }
