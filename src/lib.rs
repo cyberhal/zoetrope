@@ -37,4 +37,6 @@ pub mod autopilot;
 #[cfg(feature = "native")]
 pub mod handler;
 #[cfg(feature = "native")]
+pub mod session_catalog;
+#[cfg(feature = "native")]
 pub mod tui;

@@ -1,5 +1,17 @@
 # Slice 02 — Session Catalog and Manifests
 
+Status: implemented on `codex-slice2`; focused and full tests pass on Rust 1.88.
+
+Implementation choices: the native catalog owns injected Claude/Codex roots,
+an injectable 64 KiB header limit, and an mtime/length in-memory header cache.
+Codex family freshness is the maximum mtime in the transitive spawned-child
+closure, while only top-level sessions remain selectable roots. Equal mtimes
+break by provider and then path. Explicit files remain pinned, including child
+rollouts outside the configured discovery root. Refresh walks the bounded
+calendar hierarchy so new buckets cannot hide behind stale directory metadata;
+only changed file headers are reread when stable file identity is available,
+and platforms without it conservatively reread each bounded header.
+
 ## Contract
 
 One native catalog discovers eligible Claude and Codex roots for a cwd using bounded reads, and one manifest describes every file/actor belonging to a selected session. No tailer or CLI code reverse-engineers provider layouts.
@@ -41,4 +53,3 @@ cargo test --lib manifest
 Provisional tier: high. Selecting the wrong cwd can expose an unrelated private session. The implementation may choose cache data structures and scan ordering, but not eligibility, bounded-read behavior, path comparison, or deterministic tie-breaking.
 
 Must stay green: current Claude discovery tests and read-only/no-network guarantees.
-
