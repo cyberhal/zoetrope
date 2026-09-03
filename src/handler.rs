@@ -273,7 +273,7 @@ mod tests {
         };
         let mut app = App::new("s".into(), Mode::Replay);
         app.handle_ui_event(UiEvent::ReplayLoaded {
-            session_id: "s".into(),
+            session: "s".into(),
             items: vec![
                 item("u1", "2026-06-05T10:00:00.000Z"),
                 item("u2", "2026-06-05T10:00:01.000Z"),

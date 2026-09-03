@@ -208,9 +208,6 @@ pub(crate) fn compute_scrubber_tally(
     let len = items.len();
     let last = (width.saturating_sub(1)).max(1) as f64;
     let reach = len.saturating_sub(floor);
-    let col_idx = |c: usize| -> usize {
-        (floor + ((c as f64 / last) * reach as f64).round() as usize).min(len)
-    };
     // Spawn `tool_use_id`s that have a discovered subagent (its meta joins on the
     // same id). A subagent EXISTS from its birth, which is when its meta folds and
     // the canvas node appears — so we mark ❋ there (the meta), and the spawning
@@ -218,33 +215,45 @@ pub(crate) fn compute_scrubber_tally(
     // single-file upload). Scanned over ALL items, so it's fold-independent.
     let meta_tool_use_ids: std::collections::BTreeSet<&str> = items
         .iter()
-        .filter_map(|it| match &it.update {
-            crate::tailer::Update::SubagentMeta { meta, .. } => meta.tool_use_id.as_deref(),
+        .filter_map(|it| match &it.event.kind {
+            crate::event::EventKind::AgentDiscovered(agent) => agent.spawn.tool_call_id.as_deref(),
             _ => None,
         })
         .collect();
     let mut counts = vec![0u64; width];
     let mut spawn_at = vec![false; width];
     let mut fail_at = vec![false; width];
-    for c in 0..width {
-        let (a, b) = (col_idx(c), if c + 1 < width { col_idx(c + 1) } else { len });
-        for it in &items[a..b] {
-            match &it.update {
-                crate::tailer::Update::Entry { entry, .. } => {
-                    counts[c] += entry.tool_use_count() as u64;
-                    // A spawn call marks ❋ only when its subagent has no meta (not
-                    // loaded); otherwise the subagent's own meta marks it at birth.
-                    spawn_at[c] |= entry
-                        .spawn_tool_use_ids()
-                        .iter()
-                        .any(|id| !meta_tool_use_ids.contains(id));
-                    fail_at[c] |= entry.tool_failure_count() > 0;
+    let mut clump_start = floor;
+    let mut previous_time = None;
+    for (index, it) in items.iter().enumerate().skip(floor) {
+        if it.ts() != previous_time {
+            clump_start = index;
+            previous_time = it.ts();
+        }
+        // One provider record can normalize into several facts. Keep facts at
+        // the same instant in one scrubber column so a two-tool turn remains a
+        // two-call burst rather than being split by normalization granularity.
+        let position = clump_start.saturating_sub(floor) as f64;
+        let denominator = reach.saturating_sub(1).max(1) as f64;
+        let c = ((position / denominator) * last).round() as usize;
+        if let (Some(count), Some(spawn), Some(fail)) =
+            (counts.get_mut(c), spawn_at.get_mut(c), fail_at.get_mut(c))
+        {
+            match &it.event.kind {
+                crate::event::EventKind::ToolStarted(tool) => {
+                    *count += 1;
+                    *spawn |= tool.category != crate::event::ToolCategory::Ordinary
+                        && !meta_tool_use_ids.contains(tool.id.as_str());
+                }
+                crate::event::EventKind::ToolFinished(tool) => {
+                    *fail |= tool.outcome == crate::event::ToolOutcome::Failed;
                 }
                 // A subagent's meta discovery IS its birth on the timeline — the
                 // moment the node appears on the canvas. Mark ❋ here for every
                 // subagent, so the strip, the canvas, and the log all agree on
                 // when the agent starts to exist.
-                crate::tailer::Update::SubagentMeta { .. } => spawn_at[c] = true,
+                crate::event::EventKind::AgentDiscovered(_) => *spawn = true,
+                _ => {}
             }
         }
     }
@@ -497,8 +506,8 @@ fn render_log_line(frame: &mut Frame, row: Rect, app: &App) {
         .timeline
         .items
         .iter()
-        .filter_map(|it| match &it.update {
-            crate::tailer::Update::SubagentMeta { meta, .. } => meta.tool_use_id.clone(),
+        .filter_map(|it| match &it.event.kind {
+            crate::event::EventKind::AgentDiscovered(agent) => agent.spawn.tool_call_id.clone(),
             _ => None,
         })
         .collect();
@@ -921,6 +930,8 @@ pub(crate) fn truncate_tail(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{compute_scrubber_tally, truncate, truncate_tail, wrap};
+    use crate::event::{Provider, SessionKey};
+    use crate::formats::claude::{ClaudeDecoder, ClaudeFile};
     use crate::tailer::{ReplayItem, Source, Update};
 
     #[test]
@@ -972,22 +983,28 @@ mod tests {
         let assistant = r#"{"type":"assistant","uuid":"a","timestamp":"2026-06-05T10:00:01.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}},{"type":"tool_use","id":"t2","name":"Agent","input":{}}]}}"#;
         // A user turn carrying an errored tool_result.
         let failure = r#"{"type":"user","uuid":"u","timestamp":"2026-06-05T10:00:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":true}]}}"#;
-        let item = |line: &str, t: &str| {
-            ReplayItem::at(
-                Some(t.parse().unwrap()),
-                Update::Entry {
-                    source: Source::Main,
-                    entry: crate::transcript::parse_line(line).unwrap(),
-                },
-            )
-        };
-        let items = vec![
-            item(assistant, "2026-06-05T10:00:01.000Z"),
-            item(failure, "2026-06-05T10:00:02.000Z"),
-        ];
+        let mut decoder = ClaudeDecoder::new(
+            SessionKey {
+                provider: Provider::Claude,
+                id: "scrubber".to_owned(),
+            },
+            ClaudeFile::Root,
+        );
+        let items: Vec<_> = [assistant, failure]
+            .into_iter()
+            .flat_map(|line| decoder.decode_line(line))
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    crate::event::EventKind::ToolStarted(_)
+                        | crate::event::EventKind::ToolFinished(_)
+                )
+            })
+            .map(ReplayItem::live)
+            .collect();
 
         let t = compute_scrubber_tally(&items, 4, 0);
-        assert_eq!(t.len, 2);
+        assert_eq!(t.len, 3);
         assert_eq!(t.width, 4);
         // Two tool_use blocks total across the columns; one spawn; one failure.
         assert_eq!(t.counts.iter().sum::<u64>(), 2);

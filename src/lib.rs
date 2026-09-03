@@ -21,10 +21,10 @@
 //!
 //! Portable everywhere: the domain [`state`] (model + unified replay/live
 //! [`timeline`](state::timeline) + flow-graph projection), the [`ui`] rendering,
-//! and [`transcript`] parsing. The wire types and pure replay assembly live in
-//! [`tailer`]; its live file-tailing + the terminal loop ([`tui`]) and input
-//! ([`handler`]) are native-only (they pull tokio/crossterm/fs) and `cfg`-gated
-//! behind the `native` feature.
+//! provider-neutral [`event`] contract, provider adapters in [`formats`], and
+//! pure replay assembly in [`tailer`]. Live file-tailing + the terminal loop
+//! ([`tui`]) and input ([`handler`]) are native-only (they pull
+//! tokio/crossterm/fs) and `cfg`-gated behind the `native` feature.
 
 pub mod event;
 pub mod formats;
@@ -40,5 +40,7 @@ pub mod autopilot;
 pub mod handler;
 #[cfg(feature = "native")]
 pub mod session_catalog;
+#[cfg(feature = "native")]
+pub mod session_loader;
 #[cfg(feature = "native")]
 pub mod tui;

@@ -20,6 +20,26 @@ pub struct SessionKey {
     pub id: String,
 }
 
+#[cfg(test)]
+impl From<&str> for SessionKey {
+    fn from(id: &str) -> Self {
+        Self {
+            provider: Provider::Claude,
+            id: id.to_owned(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<String> for SessionKey {
+    fn from(id: String) -> Self {
+        Self {
+            provider: Provider::Claude,
+            id,
+        }
+    }
+}
+
 /// Stable identity of an agent within a session family.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ActorId(pub String);
@@ -61,6 +81,9 @@ pub struct SessionEvent {
 pub enum EventKind {
     SessionMetadata(SessionMetadata),
     SessionInfo(SessionInfoPatch),
+    /// A transcript record with no richer semantic payload. It keeps provider
+    /// activity and ordering observable without inventing visible content.
+    Activity,
     Prompt {
         text: String,
     },
@@ -154,6 +177,9 @@ pub struct ToolStart {
     pub name: String,
     pub category: ToolCategory,
     pub summary: Option<String>,
+    /// Context attached at the call site for spawning tools. Kept on the call
+    /// because structural child metadata can arrive from another file later.
+    pub spawn: Option<SpawnProvenance>,
 }
 
 /// Semantic category used by consumers instead of provider tool-name checks.
@@ -169,6 +195,9 @@ pub enum ToolCategory {
 pub struct ToolFinish {
     pub id: String,
     pub outcome: ToolOutcome,
+    /// Whether this completion is also evidence that a synchronously spawned
+    /// child finished. Provider adapters decide this semantic distinction.
+    pub completes_spawn: bool,
 }
 
 /// What a result record proves about the invocation.

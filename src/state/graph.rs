@@ -44,7 +44,10 @@ pub fn new_flow() -> AgentFlow {
 /// Title line for a node, given its kind and agent type.
 fn node_title(info: &AgentInfo) -> String {
     match info.kind {
-        AgentKind::Main => "claude".to_string(),
+        AgentKind::Main => info
+            .agent_type
+            .clone()
+            .unwrap_or_else(|| "session".to_string()),
         AgentKind::WorkflowGroup => info
             .agent_type
             .clone()
@@ -69,7 +72,7 @@ fn node_dims(kind: AgentKind) -> (f64, f64) {
 /// every sync (the steady state for almost all agents on almost all ticks).
 fn content_matches(info: &AgentInfo, node: &AgentNode) -> bool {
     let title_ok = match info.kind {
-        AgentKind::Main => node.title == "claude",
+        AgentKind::Main => node.title == info.agent_type.as_deref().unwrap_or("session"),
         AgentKind::WorkflowGroup => node.title == info.agent_type.as_deref().unwrap_or("workflow"),
         AgentKind::Subagent => node.title == info.agent_type.as_deref().unwrap_or("subagent"),
     };

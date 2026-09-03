@@ -1,4 +1,4 @@
-//! zoetrope — visualize Claude Code agent sessions as a live flow graph.
+//! zoetrope — visualize coding-agent sessions as a live flow graph.
 //!
 //! CLI (hand-rolled over `std::env::args`, no clap):
 //!
@@ -11,15 +11,18 @@
 //! zoe inspect <file.jsonl>  headless: print the session tree + info
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::mpsc;
 
+use zoetrope::event::{Provider, SessionKey};
+use zoetrope::session_catalog::{DiscoveryRoots, SessionCatalog, WatchTarget};
+use zoetrope::session_loader::{load_snapshot, manifest_for_file};
 use zoetrope::state::session::{AgentKind, SessionModel, ToolState};
 use zoetrope::state::{App, Mode};
-use zoetrope::tailer::{Source, TailRequest, UiEvent, Update};
-use zoetrope::{tailer, transcript, tui};
+use zoetrope::tailer::{TailRequest, UiEvent};
+use zoetrope::{tailer, tui};
 
 /// Channel capacity for the bounded request/event channels.
 const CHANNEL_CAP: usize = 32;
@@ -48,7 +51,7 @@ pub enum Cli {
 const DEFAULT_REPLAY_SPEED: f64 = 8.0;
 
 const USAGE: &str = "\
-zoetrope — visualize Claude Code agent sessions as a flow graph
+zoetrope — visualize coding-agent sessions as a flow graph
 
 USAGE:
     zoe                     follow the current project's live session
@@ -127,96 +130,6 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
     })
 }
 
-/// Read a transcript file fully and fold its lines into `model` under `source`.
-///
-/// Defensive: unreadable lines are skipped; only the file-open error propagates.
-fn fold_file(model: &mut SessionModel, path: &Path, source: Source) -> Result<()> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading transcript {}", path.display()))?;
-    for line in text.lines() {
-        if let Some(entry) = transcript::parse_line(line) {
-            model.apply_update(&Update::Entry {
-                source: source.clone(),
-                entry,
-            });
-        }
-    }
-    Ok(())
-}
-
-/// Read a `meta.json` sidecar and fold it into `model`. Missing/invalid sidecars
-/// are silently ignored — defensiveness over strictness.
-fn fold_meta(model: &mut SessionModel, path: &Path, agent_id: &str, workflow: Option<&str>) {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return;
-    };
-    if let Some(meta) = transcript::parse_meta(&text) {
-        model.apply_meta(agent_id, workflow, &meta);
-    }
-}
-
-/// Fully parse a session (main + direct subagents + workflow subagents +
-/// journals) into a [`SessionModel`], reading every sidecar discovered next to
-/// the main transcript. Shared by `inspect`; the live/replay path uses the
-/// tailer instead.
-fn parse_session_fully(main_file: &Path) -> Result<SessionModel> {
-    let session_id = main_file
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("session")
-        .to_string();
-
-    let mut model = SessionModel::new(session_id.clone());
-
-    // Subagent sidecars live in `<main_file dir>/<session-uuid>/subagents/`.
-    // Parse subagent metas + transcripts first so agents exist before the main
-    // transcript's tool_results resolve their statuses. Order is not critical —
-    // the model is fold-order independent for completion — but this keeps the
-    // tree well-formed.
-    if let Some(subs) = transcript::subagents_dir(main_file) {
-        // Direct subagents: agent-<id>.jsonl + agent-<id>.meta.json
-        collect_subagents(&mut model, &subs, None);
-
-        // Workflow subagents: workflows/<wf-id>/agent-*.jsonl + journal.jsonl
-        for wf_id in transcript::scan_workflow_ids(&subs) {
-            let wf_path = transcript::workflow_dir(&subs, &wf_id);
-            collect_subagents(&mut model, &wf_path, Some(&wf_id));
-
-            // Journal ledger marks workflow-subagent completion.
-            let journal = transcript::workflow_journal(&subs, &wf_id);
-            if journal.is_file() {
-                let _ = fold_file(&mut model, &journal, Source::Journal(wf_id.clone()));
-            }
-        }
-    }
-
-    // Finally the main transcript — its tool_results resolve subagent statuses.
-    fold_file(&mut model, main_file, Source::Main)?;
-
-    // Workflow group nodes have no direct completion signal — roll them up from
-    // their children once everything is folded.
-    model.recompute_workflow_status();
-
-    // Interactive agents (main, forks) have no completion signal: derive
-    // their liveness against the wall clock — `inspect` is a point-in-time
-    // view, so a recently active session shows `running`, a long-quiet one `idle`.
-    model.recompute_liveness(Some(chrono::Utc::now()));
-
-    Ok(model)
-}
-
-/// Discover and fold every `agent-<id>.jsonl` (+ `.meta.json`) in `dir`. Used
-/// for both direct subagents (`workflow == None`) and workflow subagents.
-fn collect_subagents(model: &mut SessionModel, dir: &Path, workflow: Option<&str>) {
-    for file in transcript::scan_subagent_files(dir, workflow) {
-        // Fold the meta sidecar first so the node exists with type/desc.
-        if file.meta.is_file() {
-            fold_meta(model, &file.meta, &file.agent_id, workflow);
-        }
-        let _ = fold_file(model, &file.transcript, Source::Sub(file.agent_id));
-    }
-}
-
 /// Run the `inspect` subcommand: fully parse the session and print a tree to
 /// stdout. Returns an error (non-zero exit) on an unreadable file. This is the
 /// headless smoke test — no TTY required.
@@ -224,11 +137,19 @@ async fn run_inspect(file: PathBuf) -> Result<()> {
     if !file.is_file() {
         bail!("not a readable file: {}", file.display());
     }
-    let model = parse_session_fully(&file)?;
-    let info = read_session_info(&file);
+    let manifest = manifest_for_file(&file)
+        .ok_or_else(|| anyhow!("unrecognized session file: {}", file.display()))?;
+    let snapshot = load_snapshot(&manifest);
+    let mut model = SessionModel::new(snapshot.key);
+    for item in &snapshot.items {
+        model.apply_event(&item.event);
+    }
+    model.recompute_workflow_status();
+    model.recompute_liveness(Some(chrono::Utc::now()));
+    let info = snapshot.info;
 
     let title = info.title.as_deref().unwrap_or("(untitled)");
-    println!("session {} — {title}", model.session_id);
+    println!("session {} — {title}", model.session.id);
     // Session-level metadata (the `i` overlay's content, headless).
     println!(
         "  mode: {} · permission: {}",
@@ -251,21 +172,6 @@ async fn run_inspect(file: PathBuf) -> Result<()> {
     print_agent_tree(&model, None, 0);
 
     Ok(())
-}
-
-/// Build `SessionInfo` from the main file's untimed flat-metadata (mirrors the
-/// timeline feeder's extraction, for the headless `inspect` path). Latest-wins by
-/// file order; counts accumulate.
-fn read_session_info(main_path: &Path) -> zoetrope::state::SessionInfo {
-    let mut info = zoetrope::state::SessionInfo::default();
-    if let Ok(text) = std::fs::read_to_string(main_path) {
-        for line in text.lines() {
-            if let Some(entry) = transcript::parse_line(line) {
-                info.apply(&entry);
-            }
-        }
-    }
-    info
 }
 
 /// Recursively print agents whose `parent` equals `parent`, in spawn order.
@@ -298,11 +204,13 @@ fn print_agent_tree(model: &SessionModel, parent: Option<&str>, depth: usize) {
         let mut ok = 0u32;
         let mut err = 0u32;
         let mut pending = 0u32;
+        let mut unknown = 0u32;
         for t in &agent.tool_calls {
             match t.state {
                 ToolState::Ok => ok += 1,
                 ToolState::Err => err += 1,
                 ToolState::Pending => pending += 1,
+                ToolState::CompletedUnknown => unknown += 1,
             }
         }
 
@@ -320,6 +228,9 @@ fn print_agent_tree(model: &SessionModel, parent: Option<&str>, depth: usize) {
             agent.tool_calls.len(),
             agent.output_tokens
         );
+        if unknown > 0 {
+            println!("{indent}    uncertain tool results: {unknown}");
+        }
 
         // Provenance: what triggered this agent (the panel's `↳ prompt`/`↳ thought`).
         if let Some(ctx) = model.provenance(agent) {
@@ -353,17 +264,25 @@ async fn run_tui(cli: Cli) -> Result<()> {
         unreachable!("inspect handled in main");
     };
 
-    let (session_id, watch_target, mode, replay, speed) = match target {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let mut catalog = SessionCatalog::new(DiscoveryRoots::from_home(&home));
+    let (session, watch_target, mode, replay, speed) = match target {
         // A concrete file → bulk-load + tail. Paced from the start unless
         // `--follow` asks to ride the (possibly still-growing) edge.
         Some(file) if file.is_file() => {
-            let session_id = file
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("session")
-                .to_string();
+            let manifest = catalog
+                .manifest(&WatchTarget::File(file.clone()))
+                .ok_or_else(|| anyhow!("unrecognized session file: {}", file.display()))?;
             let mode = if follow { Mode::Live } else { Mode::Replay };
-            (session_id, file, mode, true, speed)
+            (
+                manifest.root.key,
+                WatchTarget::File(file),
+                mode,
+                true,
+                speed,
+            )
         }
         // A directory (or none → cwd) → live: discover the latest session and
         // follow it. (The dir need not exist yet; the tailer waits.)
@@ -377,17 +296,20 @@ async fn run_tui(cli: Cli) -> Result<()> {
                 Some(d) => d,
                 None => std::env::current_dir().context("resolving current directory")?,
             };
-            let proj = transcript::project_dir(&cwd)
-                .ok_or_else(|| anyhow!("no Claude projects directory for {}", cwd.display()))?;
-            // Best-effort latest session id so stale events filter; the tailer
-            // re-discovers and may switch.
-            let session_id = transcript::latest_session_file(&proj)
-                .as_deref()
-                .and_then(Path::file_stem)
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            (session_id, proj, Mode::Live, false, DEFAULT_REPLAY_SPEED)
+            let session = catalog
+                .latest_for_cwd(&cwd)
+                .map(|found| found.key)
+                .unwrap_or(SessionKey {
+                    provider: Provider::Claude,
+                    id: String::new(),
+                });
+            (
+                session,
+                WatchTarget::LatestForCwd(cwd),
+                Mode::Live,
+                false,
+                DEFAULT_REPLAY_SPEED,
+            )
         }
     };
 
@@ -408,7 +330,7 @@ async fn run_tui(cli: Cli) -> Result<()> {
         }
     });
 
-    let app = App::new(session_id, mode);
+    let app = App::new(session, mode);
     tui::run(app, tail_tx, ui_rx).await
 }
 
@@ -553,7 +475,13 @@ mod tests {
         )
         .unwrap();
 
-        let model = parse_session_fully(&tmp).expect("parses");
+        let manifest = manifest_for_file(&tmp).expect("manifest");
+        let snapshot = load_snapshot(&manifest);
+        let mut model = SessionModel::new(snapshot.key);
+        for item in &snapshot.items {
+            model.apply_event(&item.event);
+        }
+        model.recompute_liveness(Some(chrono::Utc::now()));
         assert_eq!(
             model
                 .agent(zoetrope::state::session::MAIN_ID)

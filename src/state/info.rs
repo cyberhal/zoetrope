@@ -6,11 +6,12 @@
 //! (chronological) order, so latest-wins for the "current" values; counts
 //! accumulate.
 
-use crate::transcript::{Entry, FlatValueEntry};
+use crate::event::SessionInfoPatch;
 
 /// Session-level metadata that carries no timestamp and isn't activity.
 #[derive(Debug, Default, Clone)]
 pub struct SessionInfo {
+    pub cwd: Option<String>,
     /// Header title, from the `ai-title` entry. Session identity, not an event —
     /// it carries no timestamp and belongs here, not on the timeline.
     pub title: Option<String>,
@@ -29,62 +30,62 @@ pub struct SessionInfo {
 impl SessionInfo {
     /// Fold one flat-metadata entry into the info (latest-wins / counts). Non-
     /// metadata entries are ignored.
-    pub fn apply(&mut self, entry: &Entry) {
-        match entry {
-            Entry::AiTitle(e) => {
-                if let Some(t) = &e.title {
-                    self.title = Some(t.clone());
-                }
-            }
-            Entry::Mode(e) => self.mode = str_field(e, "mode").or(self.mode.take()),
-            Entry::PermissionMode(e) => {
-                self.permission_mode =
-                    str_field(e, "permissionMode").or(self.permission_mode.take())
-            }
-            Entry::LastPrompt(e) => {
-                self.last_prompt = str_field(e, "lastPrompt").or(self.last_prompt.take())
-            }
-            Entry::QueueOperation(e) => {
-                if str_field(e, "operation").as_deref() == Some("enqueue") {
-                    self.queued_ops += 1;
-                }
-            }
-            Entry::FileHistorySnapshot(_) => self.file_snapshots += 1,
-            _ => {}
+    pub fn apply(&mut self, patch: &SessionInfoPatch) {
+        if patch.cwd.is_some() {
+            self.cwd = patch.cwd.clone();
         }
+        if patch.title.is_some() {
+            self.title = patch.title.clone();
+        }
+        if patch.mode.is_some() {
+            self.mode = patch.mode.clone();
+        }
+        if patch.permission_mode.is_some() {
+            self.permission_mode = patch.permission_mode.clone();
+        }
+        if patch.last_prompt.is_some() {
+            self.last_prompt = patch.last_prompt.clone();
+        }
+        self.queued_ops = self.queued_ops.saturating_add(patch.queued_ops_delta);
+        self.file_snapshots = self
+            .file_snapshots
+            .saturating_add(patch.file_snapshots_delta);
     }
-}
-
-/// Pull a string field out of a flat-metadata entry's captured object.
-fn str_field(e: &FlatValueEntry, key: &str) -> Option<String> {
-    e.fields
-        .get(key)
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transcript::parse_line;
+    use crate::event::{EventKind, Provider, SessionKey};
+    use crate::formats::claude::{ClaudeDecoder, ClaudeFile};
 
     #[test]
     fn session_info_extracts_metadata_latest_wins() {
         let mut info = SessionInfo::default();
-        let p = |s: &str| parse_line(s).unwrap();
-        info.apply(&p(r#"{"type":"ai-title","aiTitle":"Build the thing"}"#));
-        info.apply(&p(r#"{"type":"mode","mode":"normal"}"#));
-        info.apply(&p(
+        let mut decoder = ClaudeDecoder::new(
+            SessionKey {
+                provider: Provider::Claude,
+                id: "s".into(),
+            },
+            ClaudeFile::Root,
+        );
+        for line in [
+            r#"{"type":"ai-title","aiTitle":"Build the thing"}"#,
+            r#"{"type":"mode","mode":"normal"}"#,
             r#"{"type":"permission-mode","permissionMode":"default"}"#,
-        ));
-        info.apply(&p(
             r#"{"type":"permission-mode","permissionMode":"acceptEdits"}"#,
-        ));
-        info.apply(&p(r#"{"type":"last-prompt","lastPrompt":"hey"}"#));
-        info.apply(&p(r#"{"type":"queue-operation","operation":"enqueue"}"#));
-        info.apply(&p(r#"{"type":"queue-operation","operation":"dequeue"}"#));
-        info.apply(&p(r#"{"type":"file-history-snapshot","messageId":"x"}"#));
-        info.apply(&p(r#"{"type":"file-history-snapshot","messageId":"y"}"#));
+            r#"{"type":"last-prompt","lastPrompt":"hey"}"#,
+            r#"{"type":"queue-operation","operation":"enqueue"}"#,
+            r#"{"type":"queue-operation","operation":"dequeue"}"#,
+            r#"{"type":"file-history-snapshot","messageId":"x"}"#,
+            r#"{"type":"file-history-snapshot","messageId":"y"}"#,
+        ] {
+            for event in decoder.decode_line(line) {
+                if let EventKind::SessionInfo(patch) = event.kind {
+                    info.apply(&patch);
+                }
+            }
+        }
 
         assert_eq!(info.title.as_deref(), Some("Build the thing"));
         assert_eq!(info.mode.as_deref(), Some("normal"));

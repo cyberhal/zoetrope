@@ -116,7 +116,7 @@ pub struct App {
     pub is_paused: bool,
     /// Id of the session currently being watched; events for other ids are
     /// dropped (stale buffered messages across a switch).
-    pub current_session_id: String,
+    pub current_session: crate::event::SessionKey,
     /// Who drives the viewport: overview (auto-fit), follow (track activity),
     /// or manual. Manual pan/zoom takes the camera; `o`/`f` give it back.
     pub camera: Camera,
@@ -184,13 +184,13 @@ pub struct App {
 impl App {
     /// Construct the initial app state for a session id and mode, with an empty
     /// configured flow and a fresh model.
-    pub fn new(session_id: String, mode: Mode) -> Self {
+    pub fn new(session: crate::event::SessionKey, mode: Mode) -> Self {
         App {
             flow: graph::new_flow(),
-            session: SessionModel::new(session_id.clone()),
+            session: SessionModel::new(session.clone()),
             mode,
             is_paused: false,
-            current_session_id: session_id,
+            current_session: session,
             camera: Camera::Overview,
             detail_scroll: 0,
             detail_follow: true,
@@ -269,11 +269,8 @@ impl App {
             .timeline
             .items
             .iter()
-            .filter_map(|i| match &i.update {
-                crate::tailer::Update::Entry {
-                    source: crate::tailer::Source::Main,
-                    entry: crate::transcript::Entry::User(e),
-                } if e.is_human_prompt() => i.ts().or(e.envelope.timestamp),
+            .filter_map(|i| match &i.event.kind {
+                crate::event::EventKind::Prompt { .. } => i.ts(),
                 _ => None,
             })
             .collect();
@@ -314,24 +311,19 @@ impl App {
     /// engaged. Switches the current session id on reset.
     pub fn handle_ui_event(&mut self, event: UiEvent) {
         match event {
-            UiEvent::Batch {
-                session_id,
-                updates,
-            } => {
-                if !self.is_current(&session_id) {
+            UiEvent::Batch { session, events } => {
+                if !self.is_current(&session) {
                     return;
                 }
                 // Route untimed session-level metadata to the info store; only
                 // real activity (timestamped / dated) goes on the timeline.
-                let mut activity = Vec::with_capacity(updates.len());
-                for update in updates {
-                    if let crate::tailer::Update::Entry { entry, .. } = &update
-                        && entry.is_timeline_noise()
-                    {
-                        self.session_info.apply(entry);
+                let mut activity = Vec::with_capacity(events.len());
+                for event in events {
+                    if let crate::event::EventKind::SessionInfo(patch) = &event.kind {
+                        self.session_info.apply(patch);
                         continue;
                     }
-                    activity.push(update);
+                    activity.push(event);
                 }
                 // Stamp freshness for the emergent "live" state.
                 self.last_batch_at = Some(web_time::Instant::now());
@@ -344,8 +336,8 @@ impl App {
                     // irrelevant) — out-of-order live arrivals never force a
                     // rebuild. Then mark the whole stream folded.
                     let mut structural = false;
-                    for update in &activity {
-                        structural |= self.session.apply_update(update);
+                    for event in &activity {
+                        structural |= self.session.apply_event(event);
                     }
                     self.timeline.append_live(activity);
                     self.timeline.folded = self.timeline.items.len();
@@ -362,12 +354,12 @@ impl App {
                 }
             }
             UiEvent::ReplayLoaded {
-                session_id,
+                session,
                 items,
                 speed,
                 info,
             } => {
-                if !self.is_current(&session_id) {
+                if !self.is_current(&session) {
                     return;
                 }
                 // Bulk hand-off: the App owns pacing from here. Fold the first
@@ -384,16 +376,16 @@ impl App {
                 let target = self.timeline.fold_target();
                 self.fold_to(target);
             }
-            UiEvent::SessionReset { session_id } => {
+            UiEvent::SessionReset { session } => {
                 // Truncation/rotation/switch: adopt the new id and rebuild
                 // from scratch so stale nodes don't linger. The tailer's
                 // initial ANNOUNCE arrives as a same-id reset on a still-empty
                 // graph — there is nothing to wipe, and resetting view state
                 // there would clobber a camera/pin choice the user made while
                 // waiting for the session to appear.
-                let genuine = !self.is_current(&session_id) || self.flow.nodes().count() > 0;
-                self.current_session_id = session_id.clone();
-                self.session = SessionModel::new(session_id);
+                let genuine = !self.is_current(&session) || self.flow.nodes().count() > 0;
+                self.current_session = session.clone();
+                self.session = SessionModel::new(session);
                 self.flow = graph::new_flow();
                 // A reset is a fresh live timeline (only live emits resets — the
                 // initial announce, truncation, or auto-switch). Replay arrives
@@ -427,7 +419,7 @@ impl App {
         }
         let mut structural = false;
         for i in self.timeline.folded..target {
-            structural |= self.session.apply_update(&self.timeline.items[i].update);
+            structural |= self.session.apply_event(&self.timeline.items[i].event);
         }
         self.timeline.folded = target;
         self.commit_fold(structural);
@@ -531,7 +523,7 @@ impl App {
             self.rebuild_to(target);
         } else {
             for i in self.timeline.folded..target {
-                self.session.apply_update(&self.timeline.items[i].update);
+                self.session.apply_event(&self.timeline.items[i].event);
             }
             self.timeline.folded = target;
             self.resync();
@@ -571,10 +563,10 @@ impl App {
             .collect();
 
         // Fresh model + flow, re-fold the prefix.
-        self.session = SessionModel::new(self.current_session_id.clone());
+        self.session = SessionModel::new(self.current_session.clone());
         self.flow = graph::new_flow();
         for i in 0..target {
-            self.session.apply_update(&self.timeline.items[i].update);
+            self.session.apply_event(&self.timeline.items[i].event);
         }
         self.timeline.folded = target;
         self.resync();
@@ -628,8 +620,8 @@ impl App {
     }
 
     /// Whether `session_id` matches the session currently being watched.
-    pub fn is_current(&self, session_id: &str) -> bool {
-        self.current_session_id == session_id
+    pub fn is_current(&self, session: &crate::event::SessionKey) -> bool {
+        self.current_session == *session
     }
 
     /// Periodic status re-derivation, called by the event loop (~1s).
@@ -826,8 +818,8 @@ mod tests {
     use crate::tailer::{UiEvent, Update};
     use crate::transcript::SubagentMeta;
 
-    fn meta_update(agent_id: &str) -> Update {
-        Update::SubagentMeta {
+    fn meta_update(agent_id: &str) -> crate::event::SessionEvent {
+        crate::tailer::item::test_event(&Update::SubagentMeta {
             agent_id: agent_id.to_string(),
             workflow: None,
             meta: SubagentMeta {
@@ -836,7 +828,7 @@ mod tests {
                 tool_use_id: Some("ag1".into()),
                 stopped_by_user: None,
             },
-        }
+        })
     }
 
     #[test]
@@ -848,14 +840,14 @@ mod tests {
 
         // Reset carrying the NEW session id (auto-switch signal).
         app.handle_ui_event(UiEvent::SessionReset {
-            session_id: "NEW".into(),
+            session: "NEW".into(),
         });
-        assert_eq!(app.current_session_id, "NEW");
+        assert_eq!(app.current_session.id, "NEW");
 
         // A batch from the new session must be accepted, not dropped.
         app.handle_ui_event(UiEvent::Batch {
-            session_id: "NEW".into(),
-            updates: vec![meta_update("newsub")],
+            session: "NEW".into(),
+            events: vec![meta_update("newsub")],
         });
         assert!(
             app.session.agent("newsub").is_some(),
@@ -870,7 +862,7 @@ mod tests {
 
         app.camera = Camera::Manual; // user took the camera…
         app.handle_ui_event(UiEvent::SessionReset {
-            session_id: "s2".into(),
+            session: "s2".into(),
         });
         // …but a fresh session re-engages the default.
         assert_eq!(app.camera, Camera::Overview);
@@ -880,8 +872,8 @@ mod tests {
     fn first_live_batch_seeds_chips_silently() {
         let mut app = App::new("s".into(), Mode::Live);
         app.handle_ui_event(UiEvent::Batch {
-            session_id: "s".into(),
-            updates: vec![meta_update("sub1")],
+            session: "s".into(),
+            events: vec![meta_update("sub1")],
         });
         assert!(
             app.chips.is_seeded(),
@@ -891,8 +883,8 @@ mod tests {
         // Replay never seeds — every paced batch is genuine activity.
         let mut replay = App::new("s".into(), Mode::Replay);
         replay.handle_ui_event(UiEvent::Batch {
-            session_id: "s".into(),
-            updates: vec![meta_update("sub1")],
+            session: "s".into(),
+            events: vec![meta_update("sub1")],
         });
         assert!(!replay.chips.is_seeded());
     }
@@ -904,7 +896,7 @@ mod tests {
         let mut app = App::new("s".into(), Mode::Live);
         app.camera = Camera::Follow; // user pressed f while waiting
         app.handle_ui_event(UiEvent::SessionReset {
-            session_id: "s".into(),
+            session: "s".into(),
         });
         assert_eq!(
             app.camera,
@@ -914,11 +906,11 @@ mod tests {
 
         // A genuine reset (graph populated) still resets the view.
         app.handle_ui_event(UiEvent::Batch {
-            session_id: "s".into(),
-            updates: vec![meta_update("sub1")],
+            session: "s".into(),
+            events: vec![meta_update("sub1")],
         });
         app.handle_ui_event(UiEvent::SessionReset {
-            session_id: "s".into(),
+            session: "s".into(),
         });
         assert_eq!(app.camera, Camera::Overview);
     }
@@ -929,8 +921,8 @@ mod tests {
         app.camera = Camera::Follow;
         // Seed chips (live mode first batch) then deliver an agent.
         app.handle_ui_event(UiEvent::Batch {
-            session_id: "s".into(),
-            updates: vec![meta_update("sub1")],
+            session: "s".into(),
+            events: vec![meta_update("sub1")],
         });
         // Simulate a moment with no selection (e.g. just after a reset).
         app.flow.clear_selection();
@@ -948,8 +940,8 @@ mod tests {
     fn batches_from_stale_session_are_dropped() {
         let mut app = App::new("CURRENT".into(), Mode::Live);
         app.handle_ui_event(UiEvent::Batch {
-            session_id: "STALE".into(),
-            updates: vec![meta_update("ghost")],
+            session: "STALE".into(),
+            events: vec![meta_update("ghost")],
         });
         assert!(
             app.session.agent("ghost").is_none(),
@@ -992,7 +984,7 @@ mod tests {
         let mut app = App::new("s".into(), Mode::Replay);
         let t: chrono::DateTime<chrono::Utc> = "2026-06-05T10:00:00.000Z".parse().unwrap();
         app.handle_ui_event(UiEvent::ReplayLoaded {
-            session_id: "s".into(),
+            session: "s".into(),
             items: vec![ReplayItem::at(Some(t), meta_update("sub1"))],
             speed: 8.0,
             info: Default::default(),
@@ -1024,6 +1016,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "native")]
     #[test]
     fn user_pan_cancels_glide() {
         let mut app = App::new("s".into(), Mode::Live);
@@ -1061,7 +1054,7 @@ mod tests {
 
         let mut app = App::new("s".into(), Mode::Replay);
         app.handle_ui_event(UiEvent::ReplayLoaded {
-            session_id: "s".into(),
+            session: "s".into(),
             items,
             speed: 8.0,
             info: Default::default(),
@@ -1118,7 +1111,7 @@ mod tests {
         ];
         let mut app = App::new("s".into(), Mode::Replay);
         app.handle_ui_event(UiEvent::ReplayLoaded {
-            session_id: "s".into(),
+            session: "s".into(),
             items,
             speed: 8.0,
             info: Default::default(),
@@ -1162,7 +1155,7 @@ mod tests {
         ];
         let mut app = App::new("s".into(), Mode::Replay);
         app.handle_ui_event(UiEvent::ReplayLoaded {
-            session_id: "s".into(),
+            session: "s".into(),
             items,
             speed: 8.0,
             info: Default::default(),
@@ -1188,7 +1181,7 @@ mod tests {
         let t2: chrono::DateTime<chrono::Utc> = "2026-06-05T10:00:10.000Z".parse().unwrap();
         let mut app = App::new("s".into(), Mode::Replay);
         app.handle_ui_event(UiEvent::ReplayLoaded {
-            session_id: "s".into(),
+            session: "s".into(),
             items: vec![
                 ReplayItem::at(Some(t1), meta_update("sub1")),
                 ReplayItem::at(Some(t2), meta_update("sub2")),
@@ -1208,8 +1201,8 @@ mod tests {
         // A genuine append lands at the edge (the file resumed): even a paced
         // replay now reads Live — "live" is following + fresh, not a mode.
         app.handle_ui_event(UiEvent::Batch {
-            session_id: "s".into(),
-            updates: vec![meta_update("sub3")],
+            session: "s".into(),
+            events: vec![meta_update("sub3")],
         });
         assert_eq!(app.transport(), Transport::Live);
         assert!(
@@ -1229,7 +1222,7 @@ mod tests {
         let t2: chrono::DateTime<chrono::Utc> = "2026-06-05T10:00:10.000Z".parse().unwrap();
         let mut app = App::new("s".into(), Mode::Replay);
         app.handle_ui_event(UiEvent::ReplayLoaded {
-            session_id: "s".into(),
+            session: "s".into(),
             items: vec![
                 ReplayItem::at(Some(t1), meta_update("sub1")),
                 ReplayItem::at(Some(t2), meta_update("sub2")),
@@ -1265,7 +1258,7 @@ mod tests {
         let t2: chrono::DateTime<chrono::Utc> = "2026-06-05T10:00:10.000Z".parse().unwrap();
         let mut app = App::new("s".into(), Mode::Replay);
         app.handle_ui_event(UiEvent::ReplayLoaded {
-            session_id: "s".into(),
+            session: "s".into(),
             items: vec![
                 ReplayItem::at(Some(t1), meta_update("sub1")),
                 ReplayItem::at(Some(t2), meta_update("sub2")),
@@ -1294,7 +1287,7 @@ mod tests {
         let t2: chrono::DateTime<chrono::Utc> = "2026-06-05T10:00:10.000Z".parse().unwrap();
         let mut app = App::new("s".into(), Mode::Replay);
         app.handle_ui_event(UiEvent::ReplayLoaded {
-            session_id: "s".into(),
+            session: "s".into(),
             items: vec![
                 ReplayItem::at(Some(t1), meta_update("sub1")),
                 ReplayItem::at(Some(t2), meta_update("sub2")),
@@ -1317,22 +1310,22 @@ mod tests {
     #[test]
     fn pausing_at_the_live_edge_buffers_appends_instead_of_snapping() {
         let e = |ts: &str| {
-            Update::Entry {
+            crate::tailer::item::test_event(&Update::Entry {
             source: crate::tailer::Source::Main,
             entry: crate::transcript::parse_line(&format!(
                 r#"{{"type":"user","uuid":"u","timestamp":"{ts}","message":{{"role":"user","content":"x"}}}}"#
             ))
             .unwrap(),
-        }
+        })
         };
         let mut app = App::new("s".into(), Mode::Live);
         app.handle_ui_event(UiEvent::SessionReset {
-            session_id: "s".into(),
+            session: "s".into(),
         });
         // Ride the live edge at t0.
         app.handle_ui_event(UiEvent::Batch {
-            session_id: "s".into(),
-            updates: vec![e("2026-06-05T10:00:00.000Z")],
+            session: "s".into(),
+            events: vec![e("2026-06-05T10:00:00.000Z")],
         });
         assert!(app.timeline.follow_head, "live session follows the edge");
         let cursor_at_pause = app.timeline.cursor;
@@ -1351,8 +1344,8 @@ mod tests {
         // timeline) without moving the parked cursor or folding into the view —
         // the whole point of live-pause. (Previously it snapped the playhead.)
         app.handle_ui_event(UiEvent::Batch {
-            session_id: "s".into(),
-            updates: vec![e("2026-06-05T10:00:10.000Z")],
+            session: "s".into(),
+            events: vec![e("2026-06-05T10:00:10.000Z")],
         });
         assert_eq!(
             app.timeline.cursor, cursor_at_pause,
@@ -1384,21 +1377,21 @@ mod tests {
     fn out_of_order_live_batch_folds_all_and_keeps_items_sorted() {
         let mut app = App::new("s".into(), Mode::Live);
         app.handle_ui_event(UiEvent::SessionReset {
-            session_id: "s".into(),
+            session: "s".into(),
         });
         let e = |ts: &str| {
-            Update::Entry {
+            crate::tailer::item::test_event(&Update::Entry {
             source: crate::tailer::Source::Main,
             entry: crate::transcript::parse_line(&format!(
                 r#"{{"type":"user","uuid":"u","timestamp":"{ts}","message":{{"role":"user","content":"x"}}}}"#
             ))
             .unwrap(),
-        }
+        })
         };
         // An out-of-order batch (file-grouped arrival / backfilled block).
         app.handle_ui_event(UiEvent::Batch {
-            session_id: "s".into(),
-            updates: vec![
+            session: "s".into(),
+            events: vec![
                 e("2026-06-05T10:00:05.000Z"),
                 e("2026-06-05T10:00:01.000Z"),
                 e("2026-06-05T10:00:03.000Z"),

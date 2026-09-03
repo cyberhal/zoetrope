@@ -35,7 +35,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use crate::tailer::{ReplayItem, Source, Timing, Update};
+use crate::event::{ActorId, EventKind, SessionEvent};
+use crate::tailer::{ReplayItem, Timing};
 
 /// The replay/live timeline and its playhead.
 pub struct Timeline {
@@ -75,7 +76,7 @@ pub struct Timeline {
     /// agent has no entries yet): a batch carrying entries for one of these
     /// must re-run dating. Lets `append_live` skip the full date-and-sort for
     /// the common in-order, fully-timed batch.
-    undated_agents: HashSet<String>,
+    undated_agents: HashSet<ActorId>,
     /// Skip inactivity: compress dead-air gaps during paced playback (see
     /// `compress_gap`). On by default (review-friendly); toggle off for
     /// faithful real-time pacing. Presentation-only — never affects content.
@@ -163,7 +164,7 @@ impl Timeline {
     /// back, or mid-replay) keeps its place and reaches the new events by playing
     /// forward, never jumping to them. New growth also un-latches the
     /// end-of-stream signal (a resumed session can end again).
-    pub fn append_live(&mut self, updates: Vec<Update>) {
+    pub(crate) fn append_live<T: crate::tailer::item::IntoSessionEvent>(&mut self, events: Vec<T>) {
         let before = self.items.len();
         // Ride the new edge only if the cursor was already at it. If behind —
         // scrubbed back, or catching up after pressing play — keep our place and
@@ -187,8 +188,8 @@ impl Timeline {
         let mut tail_ts = self.items.last().and_then(|i| i.ts());
         let mut in_order = true;
         let mut needs_dating = false;
-        for update in updates {
-            let item = ReplayItem::live(update);
+        for event in events {
+            let item = ReplayItem::live(event);
             match item.ts() {
                 Some(ts) => {
                     self.head = Some(self.head.map_or(ts, |h| h.max(ts)));
@@ -197,11 +198,7 @@ impl Timeline {
                     }
                     tail_ts = Some(tail_ts.map_or(ts, |t| t.max(ts)));
                     if !self.undated_agents.is_empty()
-                        && let Update::Entry {
-                            source: Source::Sub(id),
-                            ..
-                        } = &item.update
-                        && self.undated_agents.contains(id)
+                        && self.undated_agents.contains(&item.event.actor)
                     {
                         needs_dating = true;
                     }
@@ -231,7 +228,7 @@ impl Timeline {
             // A `Pending` item names the agent it's blocked on; `Leader`/`Dated`
             // items wait on nothing. The join target is read off the item — no
             // re-deriving it from the update shape.
-            if let Timing::Pending(agent) = &item.timing {
+            if let Timing::PendingStart(agent) | Timing::PendingEnd(agent) = &item.timing {
                 self.undated_agents.insert(agent.clone());
             }
         }
@@ -483,11 +480,11 @@ impl Timeline {
         self.items
             .iter()
             .enumerate()
-            .filter_map(|(i, item)| match &item.update {
-                Update::Entry {
-                    source: Source::Main,
-                    entry: crate::transcript::Entry::User(e),
-                } if e.is_human_prompt() => Some(i),
+            .filter_map(|(i, item)| match &item.event {
+                SessionEvent {
+                    kind: EventKind::Prompt { .. },
+                    ..
+                } => Some(i),
                 _ => None,
             })
             .collect()

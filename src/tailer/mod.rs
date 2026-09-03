@@ -7,24 +7,24 @@
 //! tick for newly created files. Replay parses everything up front, merges by
 //! timestamp, and emits wall-clock-paced batches.
 //!
-//! Everything is stamped with `session_id`; the UI drops events whose session
-//! id is not current (see [`crate::state::App::is_current`]).
+//! Everything is stamped with a provider-qualified session key; the UI drops
+//! events whose key is not current (see [`crate::state::App::is_current`]).
 //!
-//! Layout: this module holds the task entry (`run`) and the shared wire types
-//! ([`TailRequest`] / [`UiEvent`] / [`Update`] / [`Source`]); `bytes` is the
-//! pure incremental reader, `live` the live poll loop, `replay` the up-front
-//! assembly. Both feeders converge on `live::tail_loop` so every session keeps
-//! tailing.
-
-use std::path::PathBuf;
+//! Layout: this module holds the task entry (`run`) and provider-neutral feeder
+//! messages ([`TailRequest`] / [`UiEvent`]); `bytes` is the pure incremental
+//! reader, `live` the live poll loop, and `replay` the up-front assembly. Both
+//! feeders converge on `live::tail_loop` so every session keeps tailing.
 
 #[cfg(feature = "native")]
 use tokio::sync::mpsc;
 
+use crate::event::{SessionEvent, SessionKey};
+
+#[cfg(test)]
 use crate::transcript::{Entry, SubagentMeta};
 
 // Portable: the timeline item + its ordering (no IO → compiles on wasm).
-mod item;
+pub(crate) mod item;
 pub use item::ReplayItem;
 pub(crate) use item::Timing;
 #[cfg(test)]
@@ -36,7 +36,7 @@ pub use item::{DemoSubagent, replay_from_jsonl, replay_from_session};
 // they pull tokio + the filesystem, so the `native` feature gates them out of the
 // portable core (the browser frontend feeds bytes straight in, no tailing).
 #[cfg(feature = "native")]
-mod bytes;
+pub(crate) mod bytes;
 #[cfg(feature = "native")]
 mod live;
 #[cfg(feature = "native")]
@@ -52,11 +52,12 @@ use replay::run_replay;
 /// The App owns the playhead (unified Timeline model), so the tailer is a pure
 /// feeder — its only request is which session to watch.
 #[derive(Debug, Clone)]
+#[cfg(feature = "native")]
 pub enum TailRequest {
     /// Switch to watching/replaying a session. In live mode the tailer
     /// discovers the session file under the project dir; in replay it is the
     /// explicit transcript path.
-    Watch(PathBuf),
+    Watch(crate::session_catalog::WatchTarget),
 }
 
 /// Events the tailer task sends to the UI.
@@ -65,46 +66,46 @@ pub enum UiEvent {
     /// A batch of updates produced in one live poll tick (appended to the
     /// timeline's head as they arrive).
     Batch {
-        session_id: String,
-        updates: Vec<Update>,
+        session: SessionKey,
+        events: Vec<SessionEvent>,
     },
     /// The whole merged, timestamp-ordered replay stream, handed to the App
     /// once. The App owns pacing/seeking from here (the tailer does not pace).
     /// `info` carries the untimed session-level metadata (kept off the timeline).
     ReplayLoaded {
-        session_id: String,
+        session: SessionKey,
         items: Vec<ReplayItem>,
         speed: f64,
         info: crate::state::SessionInfo,
     },
     /// File truncation/rotation detected — the UI should reset its model.
-    SessionReset { session_id: String },
+    SessionReset { session: SessionKey },
     /// A non-fatal error string for display.
     Error(String),
 }
 
-/// A single unit of parsed transcript activity inside a [`UiEvent::Batch`].
-#[derive(Debug)]
-pub enum Update {
-    /// A parsed transcript entry, tagged with which file it came from.
-    Entry { source: Source, entry: Entry },
-    /// A subagent `meta.json` sidecar was discovered/parsed.
+/// Claude-shaped fixture input retained only so the pre-cutover behavior tests
+/// exercise the real adapter before reaching neutral consumers.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) enum Update {
+    Entry {
+        source: Source,
+        entry: Entry,
+    },
     SubagentMeta {
         agent_id: String,
-        /// `Some(wf_id)` if this is a workflow subagent.
         workflow: Option<String>,
         meta: SubagentMeta,
     },
+    Event(SessionEvent),
 }
 
-/// Which file an [`Update::Entry`] originated from.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Source {
-    /// The main `<session-uuid>.jsonl`.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum Source {
     Main,
-    /// A subagent file, keyed by its 17-hex-char `agentId`.
     Sub(String),
-    /// A workflow `journal.jsonl`, keyed by its workflow id.
     Journal(String),
 }
 
@@ -138,7 +139,8 @@ pub async fn run(
         };
 
         match next {
-            Flow::Switch(path) => current = path,
+            Flow::Switch(target) => current = target,
+            Flow::Reattach => {}
             Flow::Exit => return Ok(()),
         }
     }
@@ -147,15 +149,19 @@ pub async fn run(
 /// What to do after a live/replay session loop returns.
 #[cfg(feature = "native")]
 pub(crate) enum Flow {
-    /// Switch to a new file (live auto-switch or a `Watch` request).
-    Switch(PathBuf),
+    /// Replace the current watch intent after a `Watch` request.
+    Switch(crate::session_catalog::WatchTarget),
+    /// Rebuild the current target without changing directory-follow vs pinning.
+    Reattach,
     /// The request channel closed — shut down.
     Exit,
 }
 
 /// Block until the first [`TailRequest::Watch`].
 #[cfg(feature = "native")]
-async fn wait_for_watch(req_rx: &mut mpsc::Receiver<TailRequest>) -> Option<PathBuf> {
+async fn wait_for_watch(
+    req_rx: &mut mpsc::Receiver<TailRequest>,
+) -> Option<crate::session_catalog::WatchTarget> {
     match req_rx.recv().await? {
         TailRequest::Watch(path) => Some(path),
     }

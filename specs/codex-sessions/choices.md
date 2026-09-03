@@ -2,6 +2,24 @@
 
 ## Needs user
 
+### Equal-timestamp normalized facts share one scrubber position
+
+- **When:** Slice 03 (`codex-slice3`).
+- **The choice:** Several normalized facts emitted from one provider record at the same timestamp are assigned to the same scrubber column. Two tool starts in one Claude assistant turn therefore remain a visible two-call burst after the wire-to-event cutover instead of being split merely because the neutral stream has finer granularity.
+- **The gap:** The plan preserves replay presentation but does not define whether scrubber geometry is based on normalized fact index or event time when one wire record expands.
+- **The reach:** Only sparkline bin placement changes; timeline ordering, fold count, and event content remain fact-based.
+- **Verdict:** needs-user — this is a presentation default. The provisional choice preserves the existing visual meaning and is reversible inside scrubber tallying.
+- **Confidence:** medium.
+
+### Unknown tool completion is shown as a separate uncertain count
+
+- **When:** Slice 03 (`codex-slice3`).
+- **The choice:** A `CompletedUnknown` call is excluded from success, failure, and pending counts, uses a neutral question-mark state in the UI, and adds an `uncertain tool results` line to inspect output when present. It is still included in the total tool-call count.
+- **The gap:** The plan forbids presenting uncertain results as success but does not prescribe the user-facing wording or whether uncertainty belongs beside or inside the three existing tallies.
+- **The reach:** Codex spawn acknowledgements no longer appear green; Claude inspect output is byte-for-byte unchanged because it has no uncertain results.
+- **Verdict:** needs-user — the conservative state is required, while this exact presentation is a reversible product choice.
+- **Confidence:** medium.
+
 ### Compact tool summaries use a small, ordered field vocabulary
 
 - **When:** Slice 01 (`codex-slice1`).
@@ -21,6 +39,51 @@
 - **Confidence:** medium.
 
 ## Sound
+
+### Spawn provenance merges by evidence strength rather than arrival order
+
+- **When:** Slice 03 (`codex-slice3`).
+- **The choice:** Exact call-site provenance from `ToolStarted` outranks lifecycle descriptors, which outrank metadata placeholders. Weaker evidence may fill a missing field but cannot overwrite a stronger one. Equal-strength conflicts keep the earliest timestamp and then the lexicographically smaller reasoning string, so arrival order cannot choose the winner.
+- **The gap:** Parent, sidecar, and call records can arrive in either order, and the event contract did not prescribe how their overlapping provenance fields merge.
+- **The reach:** Live discovery before transcript reading and timestamp-sorted snapshot replay now produce the same prompt era and preceding reasoning for a child.
+- **Verdict:** sound — the record closest to the spawning call carries the strongest timestamp/context evidence while still allowing partial records to enrich absent fields.
+- **Confidence:** high.
+
+### Lifecycle reduction uses latest event time, with terminal evidence winning exact ties
+
+- **When:** Slice 03 (`codex-slice3`).
+- **The choice:** The model retains the latest typed lifecycle fact per agent by timestamp, so `completed → interacted → completed` reaches the same state regardless of file-delivery order. A timestamped `interacted` fact is also child activity. If two different states have the exact same or no timestamp, the deterministic order is failed, interrupted, completed, then running.
+- **The gap:** Slice 01 normalized lifecycle events but did not define commutative reduction or an equal-time rule.
+- **The reach:** Resumed Codex children cannot remain terminal because an older completion happened to arrive last, and immediate liveness recomputation cannot erase a real interaction.
+- **Verdict:** sound — timestamps are the strongest available ordering evidence; the tie rule fails toward explicit terminal evidence.
+- **Confidence:** high.
+
+### Spawn-result completion eligibility is an adapter-owned semantic fact
+
+- **When:** Slice 03 (`codex-slice3`).
+- **The choice:** `ToolFinish` states whether it may also prove completion of a synchronously spawned child. Claude results retain the legacy completion heuristic; Codex results are ineligible because spawned-thread completion comes from typed lifecycle activity.
+- **The gap:** A generic successful tool result and a child lifecycle completion are distinct facts, but the initial event contract did not encode the distinction.
+- **The reach:** The provider-neutral model contains no provider-name branch and cannot turn a Codex `spawn_agent` acknowledgement into a false terminal child.
+- **Verdict:** sound — the adapter interprets wire meaning once and consumers fold only normalized semantics.
+- **Confidence:** high.
+
+### Empty transcript records normalize to a silent activity fact
+
+- **When:** Slice 03 (`codex-slice3`).
+- **The choice:** A Claude user/assistant record that yields no richer prompt, text, reasoning, usage, or tool fact emits `Activity`. The event updates timestamps and cross-file joins but creates no log caption or tool marker.
+- **The gap:** Dropping empty sidechain records lost the only evidence for child liveness and for dating untimed metadata/journal facts.
+- **The reach:** Replay ordering and liveness preserve Claude behavior without leaking Claude wire entries into the model or inventing visible content.
+- **Verdict:** sound — the event expresses exactly the surviving evidence: activity occurred at a time.
+- **Confidence:** high.
+
+### Snapshot handoff transfers decoder state and retryable metadata
+
+- **When:** Slice 03 (`codex-slice3`).
+- **The choice:** Each tracked file crosses snapshot-to-tail with its consumed byte offset, file identity, and mutated decoder. Snapshot bytes and identity come from the same open handle. A syntactically complete final JSON record is consumed even without a trailing newline, while an incomplete tail stays unread. Codex decoders are not finalized at a temporary EOF. Known transcripts that are temporarily unreadable remain tracked with their provider decoder at offset zero, and Claude sidecars that are unreadable or malformed remain pending, so live polling retries both after the writer finishes.
+- **The gap:** Offsets alone suppress appended Codex child activity by losing the owned-turn gate; separate open/stat operations can seed mismatched identity; dropping an unreadable manifest file prevents later recovery; and treating a mid-write sidecar as consumed leaves an agent permanently unparented.
+- **The reach:** Appends between bulk load and tail start are delivered once, complete last records are not lost, partial records are not consumed early, same-size replacement is detected on the first stat, and transient transcript or sidecar writes recover without a restart.
+- **Verdict:** sound — all parsing state needed to continue a stream moves with the stream cursor.
+- **Confidence:** high.
 
 ### A result is successful or failed only when its payload provides recognizable evidence
 

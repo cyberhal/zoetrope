@@ -1,324 +1,331 @@
-//! Portable replay-stream pieces — the timeline item and its ordering.
-//!
-//! Shared by the native replay assembly ([`super::replay`]) and the App's
-//! `Timeline`, and free of any IO so it compiles on wasm too.
+//! Portable provider-neutral replay items and ordering.
 
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
-use super::{Source, Update};
-use crate::transcript::Entry;
+use crate::event::{ActorId, EventKind, EventTime, Provider, SessionEvent, SessionKey};
+use crate::formats::claude::{ClaudeDecoder, ClaudeFile, decode_subagent_metadata};
+use crate::formats::codex::CodexDecoder;
 
-/// When a timeline item happens — its single source of truth for placement.
-///
-/// An item is either `Dated` (a real timestamp — its own envelope, an inherited
-/// predecessor, or a resolved cross-file join) or **undated**, split into two
-/// distinct cases:
-///
-/// - `Pending` — an externally-dated item (a subagent `meta`, or a workflow
-///   journal `result`/`started`) whose true time lives on **another** file: the
-///   agent named by `agent`. It rides at the head until that agent's entries are
-///   discovered, then [`date_and_sort`] promotes it to `Dated`. Because `Dated`
-///   is only ever reached via a real join, the "fabricate a date then freeze it"
-///   bug is unrepresentable.
-/// - `Leader` — genuinely undated with no join target (an empty subagent file, a
-///   true stream leader). Rides at the head permanently.
+#[cfg(test)]
+type OriginalUpdate = crate::tailer::Update;
+#[cfg(not(test))]
+type OriginalUpdate = ();
+
 #[derive(Debug, Clone)]
-pub enum Timing {
+pub(crate) enum Timing {
     Dated(DateTime<Utc>),
-    /// Undated, waiting on `agent`'s entries to appear (cross-file join).
-    Pending(String),
-    /// Undated with nothing to wait on.
+    PendingStart(ActorId),
+    PendingEnd(ActorId),
     Leader,
 }
 
-/// One merged replay step: an entry/meta update with its `Timing`.
-///
-/// The whole `Vec<ReplayItem>` is handed to the App via `UiEvent::ReplayLoaded`;
-/// the App's `Timeline` owns it and folds a prefix up to the playhead.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ReplayItem {
     pub(crate) timing: Timing,
-    pub update: Update,
+    pub event: SessionEvent,
+    #[cfg(test)]
+    pub(crate) update: crate::tailer::Update,
 }
 
 impl ReplayItem {
-    /// The resolved timestamp, if the item is dated — the value all the
-    /// timeline geometry (folding, sorting, the scrubber) reads. `Pending` and
-    /// `Leader` are both undated → `None` (they sort to the head).
     pub fn ts(&self) -> Option<DateTime<Utc>> {
         match self.timing {
-            Timing::Dated(t) => Some(t),
-            Timing::Pending(_) | Timing::Leader => None,
+            Timing::Dated(timestamp) => Some(timestamp),
+            Timing::PendingStart(_) | Timing::PendingEnd(_) | Timing::Leader => None,
         }
     }
 
-    /// Build an item from an already-resolved timestamp: `Some` → `Dated`,
-    /// `None` → the undated case implied by `update` (a meta / agent-referencing
-    /// journal line → `Pending` on that agent; anything else → `Leader`).
-    pub(crate) fn at(ts: Option<DateTime<Utc>>, update: Update) -> Self {
-        let timing = match ts {
-            Some(t) => Timing::Dated(t),
-            None => undated_timing(&update),
+    pub(crate) fn new(event: SessionEvent, inherited: Option<DateTime<Utc>>) -> Self {
+        let timing = match &event.time {
+            EventTime::At(timestamp) => Timing::Dated(*timestamp),
+            EventTime::AtAgentStart(actor) => Timing::PendingStart(actor.clone()),
+            EventTime::AtAgentEnd(actor) => Timing::PendingEnd(actor.clone()),
+            EventTime::Untimed => inherited.map_or(Timing::Leader, Timing::Dated),
         };
-        ReplayItem { timing, update }
+        Self {
+            timing,
+            #[cfg(test)]
+            update: crate::tailer::Update::Event(event.clone()),
+            event,
+        }
     }
 
-    /// Wrap a live update as a timeline item, taking its timestamp from the
-    /// entry envelope (metas/journals carry none → undated, they ride at the
-    /// head until dated).
-    pub fn live(update: Update) -> Self {
-        let ts = match &update {
-            Update::Entry { entry, .. } => entry_timestamp(entry),
-            Update::SubagentMeta { .. } => None,
-        };
-        Self::at(ts, update)
+    pub(crate) fn live(event: impl IntoSessionEvent) -> Self {
+        let (event, update) = event.into_parts();
+        with_original_update(Self::new(event, None), update)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn at(timestamp: Option<DateTime<Utc>>, update: impl IntoSessionEvent) -> Self {
+        let (mut event, original) = update.into_parts();
+        if let Some(timestamp) = timestamp {
+            event.time = EventTime::At(timestamp);
+        }
+        let mut item = Self::new(event, None);
+        if let Some(update) = original {
+            item.update = update;
+        }
+        item
     }
 }
 
-/// The undated `Timing` for an update with no resolved timestamp: `Pending` on
-/// the agent it references (a subagent meta, or a journal `result`/`started`),
-/// else `Leader`.
-fn undated_timing(update: &Update) -> Timing {
-    let agent = match update {
-        Update::SubagentMeta { agent_id, .. } => Some(agent_id.clone()),
-        Update::Entry {
-            source: Source::Journal(_),
-            entry,
-        } => match entry {
-            Entry::Result(l) => l.agent_id.clone(),
-            Entry::Started(l) => l.agent_id.clone(),
-            _ => None,
-        },
-        Update::Entry { .. } => None,
+#[cfg(test)]
+fn with_original_update(mut item: ReplayItem, update: Option<OriginalUpdate>) -> ReplayItem {
+    if let Some(update) = update {
+        item.update = update;
+    }
+    item
+}
+
+#[cfg(not(test))]
+fn with_original_update(item: ReplayItem, update: Option<OriginalUpdate>) -> ReplayItem {
+    debug_assert!(update.is_none());
+    item
+}
+
+#[cfg(test)]
+pub(crate) fn test_event(update: &crate::tailer::Update) -> SessionEvent {
+    use crate::formats::claude::{ClaudeDecoder, ClaudeFile, decode_subagent_metadata};
+    use crate::tailer::{Source, Update};
+    let key = SessionKey {
+        provider: Provider::Claude,
+        id: "s".to_owned(),
     };
-    agent.map_or(Timing::Leader, Timing::Pending)
+    let events = match update {
+        Update::Event(event) => return event.clone(),
+        Update::Entry { source, entry } => {
+            let file = match source {
+                Source::Main => ClaudeFile::Root,
+                Source::Sub(agent_id) => ClaudeFile::Subagent {
+                    agent_id: agent_id.clone(),
+                    workflow: None,
+                },
+                Source::Journal(workflow) => ClaudeFile::WorkflowJournal {
+                    workflow: workflow.clone(),
+                },
+            };
+            let mut decoder = ClaudeDecoder::new(key, file);
+            decoder.decode_test_entry(entry.clone())
+        }
+        Update::SubagentMeta {
+            agent_id,
+            workflow,
+            meta,
+        } => decode_subagent_metadata(
+            &key,
+            agent_id,
+            workflow.as_deref(),
+            &serde_json::json!({
+                "agentType": meta.agent_type,
+                "description": meta.description,
+                "toolUseId": meta.tool_use_id,
+                "stoppedByUser": meta.stopped_by_user,
+            })
+            .to_string(),
+        ),
+    };
+    events
+        .into_iter()
+        .find(|event| {
+            !matches!(
+                event.kind,
+                EventKind::SessionMetadata(_) | EventKind::SessionInfo(_)
+            )
+        })
+        .unwrap_or(SessionEvent {
+            actor: ActorId::from("s"),
+            time: EventTime::Untimed,
+            kind: EventKind::Reasoning {
+                text: String::new(),
+            },
+        })
 }
 
-/// Date the untimed items in place — metas → their agent's first entry, journal
-/// `result`/`started` → that agent's last/first entry (else earliest) — then
-/// stably sort the whole list by timestamp. For the one-shot
-/// bulk replay assembly, where every file has already been parsed so an
-/// unmatched journal agent is genuinely an orphan.
-///
-/// Ties sort metas before entries (so an agent exists before its first entry
-/// folds); remaining `None` timestamps (true leaders / empty subagent files)
-/// sort first. Idempotent: a meta with no entry yet stays `None` and is re-dated
-/// once its entries arrive on a later call.
+pub(crate) trait IntoSessionEvent {
+    fn into_parts(self) -> (SessionEvent, Option<OriginalUpdate>);
+}
+
+impl IntoSessionEvent for SessionEvent {
+    fn into_parts(self) -> (SessionEvent, Option<OriginalUpdate>) {
+        (self, None)
+    }
+}
+
+#[cfg(test)]
+impl IntoSessionEvent for crate::tailer::Update {
+    fn into_parts(self) -> (SessionEvent, Option<OriginalUpdate>) {
+        (test_event(&self), Some(self))
+    }
+}
+
 pub(crate) fn date_and_sort(items: &mut [ReplayItem]) {
     date_and_sort_inner(items, true);
 }
 
-/// Like [`date_and_sort`], but for the growing live stream: a journal entry
-/// whose agent has no entries YET stays undated — riding at the head like a
-/// meta — so a later call re-dates it once the agent's transcript is
-/// discovered. The bulk fallback to `earliest` would permanently stamp it with
-/// the session START (a `Dated` item is never re-guessed), pinning e.g. a
-/// workflow `result` hours before the workflow ran.
 pub(crate) fn date_and_sort_live(items: &mut [ReplayItem]) {
     date_and_sort_inner(items, false);
 }
 
 fn date_and_sort_inner(items: &mut [ReplayItem], complete: bool) {
-    let earliest = items.iter().filter_map(|i| i.ts()).min();
-
-    let mut first_entry_ts: HashMap<String, DateTime<Utc>> = HashMap::new();
-    let mut last_entry_ts: HashMap<String, DateTime<Utc>> = HashMap::new();
+    let earliest = items.iter().filter_map(ReplayItem::ts).min();
+    let mut first: HashMap<ActorId, DateTime<Utc>> = HashMap::new();
+    let mut last: HashMap<ActorId, DateTime<Utc>> = HashMap::new();
     for item in items.iter() {
-        if let (
-            Some(ts),
-            Update::Entry {
-                source: Source::Sub(id),
-                ..
-            },
-        ) = (item.ts(), &item.update)
-        {
-            first_entry_ts
-                .entry(id.clone())
-                .and_modify(|t| *t = (*t).min(ts))
-                .or_insert(ts);
-            last_entry_ts
-                .entry(id.clone())
-                .and_modify(|t| *t = (*t).max(ts))
-                .or_insert(ts);
-        }
+        let Some(timestamp) = item.ts() else { continue };
+        first
+            .entry(item.event.actor.clone())
+            .and_modify(|known| *known = (*known).min(timestamp))
+            .or_insert(timestamp);
+        last.entry(item.event.actor.clone())
+            .and_modify(|known| *known = (*known).max(timestamp))
+            .or_insert(timestamp);
     }
     for item in items.iter_mut() {
-        // A `Dated` item is settled — only undated (`Pending`/`Leader`) items
-        // try to resolve, so a resolved date can never be re-guessed.
-        if matches!(item.timing, Timing::Dated(_)) {
-            continue;
-        }
-        // The join rule (which edge of the agent's lifespan to borrow, and the
-        // bulk-only orphan fallback) is domain logic keyed on the update kind.
-        let resolved = match &item.update {
-            Update::SubagentMeta { agent_id, .. } => first_entry_ts.get(agent_id).copied(),
-            Update::Entry {
-                source: Source::Journal(_),
-                entry,
-            } => match entry {
-                Entry::Result(l) => l
-                    .agent_id
-                    .as_ref()
-                    .and_then(|id| last_entry_ts.get(id))
-                    .copied(),
-                Entry::Started(l) => l
-                    .agent_id
-                    .as_ref()
-                    .and_then(|id| first_entry_ts.get(id))
-                    .copied(),
-                _ => None,
-            }
-            // Bulk only: an orphan journal entry (no matching transcript
-            // anywhere) → earliest, so it folds with the start instead of
-            // leading as an untimed item. Live keeps it undated so it can
-            // be re-dated once the agent's file is discovered. (Metas never
-            // take this fallback — they stay `Pending` until their agent lands.)
-            .or(if complete { earliest } else { None }),
-            _ => None,
+        let resolved = match &item.timing {
+            Timing::PendingStart(actor) => first
+                .get(actor)
+                .copied()
+                .or(complete.then_some(earliest).flatten())
+                .map_or_else(|| Timing::PendingStart(actor.clone()), Timing::Dated),
+            Timing::PendingEnd(actor) => last
+                .get(actor)
+                .copied()
+                .or(complete.then_some(earliest).flatten())
+                .map_or_else(|| Timing::PendingEnd(actor.clone()), Timing::Dated),
+            timing => timing.clone(),
         };
-        if let Some(t) = resolved {
-            item.timing = Timing::Dated(t);
+        if let Timing::Dated(timestamp) = &resolved {
+            item.event.time = EventTime::At(*timestamp);
         }
+        item.timing = resolved;
     }
-
-    let rank = |u: &Update| match u {
-        Update::SubagentMeta { .. } => 0u8,
-        Update::Entry { .. } => 1u8,
-    };
-    items.sort_by(|a, b| match (a.ts(), b.ts()) {
-        (Some(x), Some(y)) => x
-            .cmp(&y)
-            .then_with(|| rank(&a.update).cmp(&rank(&b.update))),
-        (Some(_), None) => std::cmp::Ordering::Greater,
-        (None, Some(_)) => std::cmp::Ordering::Less,
-        (None, None) => std::cmp::Ordering::Equal,
+    items.sort_by(|left, right| {
+        left.ts()
+            .cmp(&right.ts())
+            .then_with(|| event_rank(&left.event).cmp(&event_rank(&right.event)))
     });
 }
 
-/// The envelope timestamp of an entry, if it carries one.
-pub(crate) fn entry_timestamp(entry: &Entry) -> Option<DateTime<Utc>> {
-    match entry {
-        Entry::User(e) => e.envelope.timestamp,
-        Entry::Assistant(e) => e.envelope.timestamp,
-        Entry::System(e) => e.envelope.timestamp,
-        Entry::Attachment(e) => e.envelope.timestamp,
-        _ => None,
+fn event_rank(event: &SessionEvent) -> u8 {
+    match event.kind {
+        EventKind::AgentDiscovered(_) => 0,
+        EventKind::AgentMetadata(_) | EventKind::WorkflowDeclared(_) => 1,
+        _ => 2,
     }
 }
 
-/// Build a replay stream from a single transcript's text — the browser
-/// frontend's data source (a bundled or drag-dropped `.jsonl`).
-///
-/// Unlike the native `build_replay`, there are no sidecar files to discover, so
-/// this parses only the main transcript: subagents appear only insofar as it
-/// records them (their own transcripts live in separate files the browser can't
-/// reach). Untimed session metadata is routed into [`SessionInfo`](crate::state::SessionInfo);
-/// the rest is dated and stably sorted — same shape the App expects from
-/// `UiEvent::ReplayLoaded`.
+/// Browser/static single-file replay with content-based format detection.
 pub fn replay_from_jsonl(text: &str) -> (Vec<ReplayItem>, crate::state::SessionInfo) {
-    let mut items: Vec<ReplayItem> = Vec::new();
-    push_lines(text, &Source::Main, &mut items);
-    finish(items)
+    let provider = detect_provider(text);
+    let key = SessionKey {
+        provider,
+        id: "session".to_owned(),
+    };
+    let events = match provider {
+        Provider::Claude => {
+            let mut decoder = ClaudeDecoder::new(key, ClaudeFile::Root);
+            text.lines()
+                .flat_map(|line| decoder.decode_line(line))
+                .collect()
+        }
+        Provider::Codex => {
+            let mut decoder = CodexDecoder::new();
+            text.lines()
+                .flat_map(|line| decoder.decode_line(line))
+                .collect()
+        }
+    };
+    finish(events)
 }
 
-/// One non-main file for [`replay_from_session`]: a subagent's transcript +
-/// `meta.json`, or a workflow's `journal.jsonl`.
-///
-/// Mirrors what the native `build_replay` discovers on disk, so the browser
-/// frontend (which has no filesystem — JS reads the files and hands the text
-/// across) produces the same graph from the same session.
+fn detect_provider(text: &str) -> Provider {
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(|kind| kind.as_str()) == Some("session_meta")
+            && value.get("payload").is_some()
+        {
+            return Provider::Codex;
+        }
+        return Provider::Claude;
+    }
+    Provider::Claude
+}
+
 pub struct DemoSubagent<'a> {
     pub agent_id: &'a str,
     pub meta: &'a str,
     pub transcript: &'a str,
-    /// Owning workflow id for anything under `subagents/workflows/<id>/`;
-    /// `None` for a direct subagent. Drives the group node + parentage.
     pub workflow: Option<&'a str>,
-    /// True when `transcript` is a workflow's `journal.jsonl` rather than a
-    /// subagent transcript — it folds under [`Source::Journal`] and carries no
-    /// meta. Requires `workflow` to be set.
     pub journal: bool,
 }
 
-/// Build a replay stream from a full session's files — the main transcript plus
-/// subagents (transcript + meta), workflow subagents, and workflow journals.
-/// This is the multi-file equivalent of [`replay_from_jsonl`]; the native side
-/// reads the same shapes off disk via `build_replay`. The meta sets each
-/// subagent's parent (→ main, or → its workflow group) and type, so the graph
-/// connects even before the spawning tool call is folded.
 pub fn replay_from_session(
     main: &str,
-    subagents: &[DemoSubagent],
+    subagents: &[DemoSubagent<'_>],
 ) -> (Vec<ReplayItem>, crate::state::SessionInfo) {
-    let mut items: Vec<ReplayItem> = Vec::new();
-    push_lines(main, &Source::Main, &mut items);
-    for sub in subagents {
-        // A journal belongs to the workflow, not to any one agent: no meta, and
-        // it folds under its own source. Ignore one with no workflow id — there
-        // is nothing to attribute it to.
-        if sub.journal {
-            if let Some(wf) = sub.workflow {
-                push_lines(sub.transcript, &Source::Journal(wf.to_string()), &mut items);
-            }
-            continue;
-        }
-        if let Ok(meta) = serde_json::from_str::<crate::transcript::SubagentMeta>(sub.meta) {
-            items.push(ReplayItem::at(
-                None,
-                Update::SubagentMeta {
-                    agent_id: sub.agent_id.to_string(),
-                    workflow: sub.workflow.map(str::to_owned),
-                    meta,
+    let key = SessionKey {
+        provider: Provider::Claude,
+        id: "session".to_owned(),
+    };
+    let mut events = decode_claude_text(main, &key, ClaudeFile::Root);
+    for subagent in subagents {
+        if subagent.journal {
+            let Some(workflow) = subagent.workflow else {
+                continue;
+            };
+            events.extend(decode_claude_text(
+                subagent.transcript,
+                &key,
+                ClaudeFile::WorkflowJournal {
+                    workflow: workflow.to_owned(),
                 },
             ));
-        }
-        push_lines(
-            sub.transcript,
-            &Source::Sub(sub.agent_id.to_string()),
-            &mut items,
-        );
-    }
-    finish(items)
-}
-
-/// Parse a transcript's complete lines into `items` under `source`, inheriting
-/// the previous in-file timestamp for entries that lack one.
-fn push_lines(text: &str, source: &Source, items: &mut Vec<ReplayItem>) {
-    let mut last_ts: Option<DateTime<Utc>> = None;
-    for line in text.lines() {
-        if line.trim().is_empty() {
             continue;
         }
-        let Some(entry) = crate::transcript::parse_line(line) else {
-            continue;
-        };
-        let ts = entry_timestamp(&entry).or(last_ts);
-        if ts.is_some() {
-            last_ts = ts;
-        }
-        items.push(ReplayItem::at(
-            ts,
-            Update::Entry {
-                source: source.clone(),
-                entry,
+        events.extend(decode_subagent_metadata(
+            &key,
+            subagent.agent_id,
+            subagent.workflow,
+            subagent.meta,
+        ));
+        events.extend(decode_claude_text(
+            subagent.transcript,
+            &key,
+            ClaudeFile::Subagent {
+                agent_id: subagent.agent_id.to_owned(),
+                workflow: subagent.workflow.map(str::to_owned),
             },
         ));
     }
+    finish(events)
 }
 
-/// Route untimed session-level metadata into the info store (dropping it from
-/// the timeline), then date + stably sort the rest.
-fn finish(mut items: Vec<ReplayItem>) -> (Vec<ReplayItem>, crate::state::SessionInfo) {
+fn decode_claude_text(text: &str, key: &SessionKey, source: ClaudeFile) -> Vec<SessionEvent> {
+    let mut decoder = ClaudeDecoder::new(key.clone(), source);
+    text.lines()
+        .flat_map(|line| decoder.decode_line(line))
+        .collect()
+}
+
+pub(crate) fn finish(events: Vec<SessionEvent>) -> (Vec<ReplayItem>, crate::state::SessionInfo) {
     let mut info = crate::state::SessionInfo::default();
-    items.retain(|item| match &item.update {
-        Update::Entry { entry, .. } if entry.is_timeline_noise() => {
-            info.apply(entry);
-            false
+    let mut items = Vec::new();
+    let mut inherited: HashMap<ActorId, DateTime<Utc>> = HashMap::new();
+    for event in events {
+        if let EventKind::SessionInfo(patch) = &event.kind {
+            info.apply(patch);
+            continue;
         }
-        _ => true,
-    });
+        let prior = inherited.get(&event.actor).copied();
+        if let EventTime::At(timestamp) = event.time {
+            inherited.insert(event.actor.clone(), timestamp);
+        }
+        items.push(ReplayItem::new(event, prior));
+    }
     date_and_sort(&mut items);
     (items, info)
 }
@@ -329,70 +336,56 @@ mod tests {
 
     #[test]
     fn journal_ledger_dates_to_the_agents_first_or_last_entry() {
-        let sub = |t: &str| {
+        let sub = |time: &str| {
             format!(
-                r#"{{"type":"user","uuid":"u","timestamp":"{t}","message":{{"role":"user","content":"x"}}}}"#
+                r#"{{"type":"user","uuid":"u","timestamp":"{time}","message":{{"role":"user","content":"x"}}}}"#
             )
         };
-        let mut items = Vec::new();
-        // The subagent's own transcript: first entry at :05, last at :15.
-        push_lines(
-            &format!(
-                "{}\n{}\n",
-                sub("2026-06-05T10:00:05.000Z"),
-                sub("2026-06-05T10:00:15.000Z")
-            ),
-            &Source::Sub("subX".into()),
-            &mut items,
+        let sub_text = format!(
+            "{}\n{}\n",
+            sub("2026-06-05T10:00:05.000Z"),
+            sub("2026-06-05T10:00:15.000Z")
         );
-        // Undated journal ledger lines for that agent — must borrow opposite ends
-        // of its lifespan: `started` → first entry, `result` → last entry.
-        push_lines(
+        let journal = concat!(
             r#"{"type":"started","key":"k","agentId":"subX"}"#,
-            &Source::Journal("wf".into()),
-            &mut items,
-        );
-        push_lines(
+            "\n",
             r#"{"type":"result","key":"k","agentId":"subX","result":"done"}"#,
-            &Source::Journal("wf".into()),
-            &mut items,
+            "\n",
         );
-
-        date_and_sort(&mut items);
-
-        let started_ts = items
-            .iter()
-            .find(|i| {
-                matches!(
-                    &i.update,
-                    Update::Entry {
-                        entry: Entry::Started(_),
-                        ..
-                    }
-                )
+        let subs = [
+            DemoSubagent {
+                agent_id: "subX",
+                meta: "{}",
+                transcript: &sub_text,
+                workflow: Some("wf"),
+                journal: false,
+            },
+            DemoSubagent {
+                agent_id: "",
+                meta: "",
+                transcript: journal,
+                workflow: Some("wf"),
+                journal: true,
+            },
+        ];
+        let (items, _) = replay_from_session("", &subs);
+        let status_time = |wanted| {
+            items.iter().find_map(|item| match &item.event.kind {
+                EventKind::AgentStatus { agent_id, status }
+                    if agent_id.0 == "subX" && *status == wanted =>
+                {
+                    item.ts()
+                }
+                _ => None,
             })
-            .and_then(|i| i.ts());
-        let result_ts = items
-            .iter()
-            .find(|i| {
-                matches!(
-                    &i.update,
-                    Update::Entry {
-                        entry: Entry::Result(_),
-                        ..
-                    }
-                )
-            })
-            .and_then(|i| i.ts());
+        };
         assert_eq!(
-            started_ts,
-            Some("2026-06-05T10:00:05.000Z".parse::<DateTime<Utc>>().unwrap()),
-            "journal `started` dates to the agent's FIRST entry"
+            status_time(crate::event::RecordedAgentStatus::Running),
+            Some("2026-06-05T10:00:05.000Z".parse().unwrap())
         );
         assert_eq!(
-            result_ts,
-            Some("2026-06-05T10:00:15.000Z".parse::<DateTime<Utc>>().unwrap()),
-            "journal `result` dates to the agent's LAST entry"
+            status_time(crate::event::RecordedAgentStatus::Completed),
+            Some("2026-06-05T10:00:15.000Z".parse().unwrap())
         );
     }
 
@@ -400,30 +393,27 @@ mod tests {
     fn replay_from_jsonl_parses_orders_and_routes_noise() {
         let text = concat!(
             r#"{"type":"user","uuid":"u1","timestamp":"2026-06-05T10:00:02.000Z","message":{"role":"user","content":"second"}}"#,
-            "\n",
-            "\n",
+            "\n\n",
             r#"{"type":"user","uuid":"u0","timestamp":"2026-06-05T10:00:01.000Z","message":{"role":"user","content":"first"}}"#,
-            "\n",
-            r#"garbage that should be skipped"#,
-            "\n",
+            "\ngarbage that should be skipped\n",
         );
-        let (items, _info) = replay_from_jsonl(text);
-        // Two valid entries (blank + garbage skipped), sorted by timestamp.
-        assert_eq!(items.len(), 2);
-        assert!(items[0].ts().unwrap() < items[1].ts().unwrap());
-        // All from the main source.
-        assert!(items.iter().all(|i| matches!(
-            &i.update,
-            Update::Entry {
-                source: Source::Main,
-                ..
-            }
-        )));
+        let (items, _) = replay_from_jsonl(text);
+        let activity: Vec<_> = items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.event.kind,
+                    EventKind::Prompt { .. } | EventKind::Activity
+                )
+            })
+            .collect();
+        assert_eq!(activity.len(), 2);
+        assert!(activity[0].ts().unwrap() < activity[1].ts().unwrap());
+        assert!(activity.iter().all(|item| item.event.actor.0 == "session"));
     }
 
     #[test]
     fn replay_from_session_emits_subagent_meta_and_sub_entries() {
-        let main = r#"{"type":"user","uuid":"u1","timestamp":"2026-06-05T10:00:00.000Z","message":{"role":"user","content":"go"}}"#;
         let sub = DemoSubagent {
             agent_id: "a1000000000000001",
             meta: r#"{"agentType":"Explore","description":"map it","toolUseId":"toolu_1"}"#,
@@ -431,32 +421,19 @@ mod tests {
             workflow: None,
             journal: false,
         };
-        let (items, _info) = replay_from_session(main, &[sub]);
-
-        assert!(
-            items
-                .iter()
-                .any(|i| matches!(&i.update, Update::SubagentMeta { agent_id, .. } if agent_id == "a1000000000000001")),
-            "a subagent meta is emitted"
-        );
-        assert!(
-            items.iter().any(|i| matches!(
-                &i.update,
-                Update::Entry { source: Source::Sub(id), .. } if id == "a1000000000000001"
-            )),
-            "subagent entries are tagged Source::Sub"
-        );
+        let (items, _) = replay_from_session("", &[sub]);
+        assert!(items.iter().any(|item| matches!(
+            &item.event.kind,
+            EventKind::AgentDiscovered(agent) if agent.id.0 == "a1000000000000001"
+        )));
+        assert!(items.iter().any(|item| {
+            item.event.actor.0 == "a1000000000000001"
+                && matches!(item.event.kind, EventKind::Activity)
+        }));
     }
 
-    /// Workflow parity with the native loader: a subagent under
-    /// `subagents/workflows/<id>/` must carry its workflow id (so the model
-    /// creates the group node and parents it there), and the workflow's
-    /// `journal.jsonl` must fold under `Source::Journal` — not as a subagent.
-    /// Without this the browser silently renders workflow sessions as a flat
-    /// fan-out, while the native TUI shows the group.
     #[test]
     fn replay_from_session_tags_workflow_subagents_and_journals() {
-        let main = r#"{"type":"user","uuid":"u1","timestamp":"2026-06-05T10:00:00.000Z","message":{"role":"user","content":"go"}}"#;
         let subs = [
             DemoSubagent {
                 agent_id: "w1000000000000001",
@@ -473,29 +450,73 @@ mod tests {
                 journal: true,
             },
         ];
-        let (items, _info) = replay_from_session(main, &subs);
+        let (items, _) = replay_from_session("", &subs);
+        assert!(items.iter().any(|item| matches!(
+            &item.event.kind,
+            EventKind::AgentDiscovered(agent)
+                if agent.id.0 == "w1000000000000001" && agent.parent.0 == "wf-99"
+        )));
+        assert!(items.iter().any(|item| matches!(
+            &item.event.kind,
+            EventKind::AgentStatus { agent_id, status: crate::event::RecordedAgentStatus::Running }
+                if agent_id.0 == "w1000000000000001"
+        )));
+        assert!(!items.iter().any(|item| item.event.actor.0.is_empty()));
+    }
 
+    #[test]
+    fn content_detection_replays_codex_without_a_filename_hint() {
+        let text = include_str!("../../tests/fixtures/codex/root-current.jsonl");
+        let (items, _) = replay_from_jsonl(text);
+        assert!(items.iter().any(|item| matches!(
+            &item.event.kind,
+            EventKind::SessionMetadata(metadata) if metadata.session.provider == Provider::Codex
+        )));
         assert!(
-            items.iter().any(|i| matches!(
-                &i.update,
-                Update::SubagentMeta { agent_id, workflow: Some(wf), .. }
-                    if agent_id == "w1000000000000001" && wf == "wf-99"
-            )),
-            "a workflow subagent's meta carries its workflow id"
+            items
+                .iter()
+                .any(|item| matches!(item.event.kind, EventKind::Prompt { .. }))
         );
-        assert!(
-            items.iter().any(|i| matches!(
-                &i.update,
-                Update::Entry { source: Source::Journal(wf), .. } if wf == "wf-99"
-            )),
-            "journal lines fold under Source::Journal, not Source::Sub"
-        );
-        assert!(
-            !items.iter().any(|i| matches!(
-                &i.update,
-                Update::Entry { source: Source::Sub(id), .. } if id.is_empty()
-            )),
-            "the journal is not mistaken for a subagent transcript"
-        );
+    }
+
+    #[test]
+    fn equal_time_discovery_precedes_child_activity() {
+        let timestamp = "2026-06-05T10:00:00Z".parse().unwrap();
+        let child = ActorId::from("child");
+        let mut items = vec![
+            ReplayItem::new(
+                SessionEvent {
+                    actor: child.clone(),
+                    time: EventTime::At(timestamp),
+                    kind: EventKind::Reasoning {
+                        text: "work".into(),
+                    },
+                },
+                None,
+            ),
+            ReplayItem::new(
+                SessionEvent {
+                    actor: ActorId::from("root"),
+                    time: EventTime::At(timestamp),
+                    kind: EventKind::AgentDiscovered(crate::event::AgentDescriptor {
+                        id: child,
+                        parent: ActorId::from("root"),
+                        spawn: crate::event::SpawnProvenance {
+                            tool_call_id: None,
+                            time: EventTime::At(timestamp),
+                            preceding_context: None,
+                        },
+                        role: crate::event::AgentRole::Subagent,
+                        label: None,
+                        agent_type: None,
+                        description: None,
+                        interactive: false,
+                    }),
+                },
+                None,
+            ),
+        ];
+        date_and_sort(&mut items);
+        assert!(matches!(items[0].event.kind, EventKind::AgentDiscovered(_)));
     }
 }

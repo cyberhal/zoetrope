@@ -6,8 +6,6 @@
 
 use std::path::Path;
 
-use crate::transcript::{self, Entry};
-
 /// A single line longer than this (no newline yet) is treated as pathological:
 /// the buffered prefix is dropped and parsing resyncs at the next newline, so a
 /// newline-less or runaway line can never grow `partial` unbounded.
@@ -30,6 +28,16 @@ pub struct TailState {
     identity: Option<(u64, u64)>,
 }
 
+impl TailState {
+    pub(crate) fn at_snapshot(offset: u64, metadata: Option<&std::fs::Metadata>) -> Self {
+        Self {
+            offset,
+            identity: metadata.and_then(file_identity),
+            ..Self::default()
+        }
+    }
+}
+
 /// Outcome of reading appended bytes from a file.
 pub(crate) enum ReadResult {
     /// File missing or unreadable.
@@ -39,7 +47,7 @@ pub(crate) enum ReadResult {
     /// File shrank (truncation/rotation) — state was reset to zero.
     Reset,
     /// Newly completed lines parsed from appended bytes.
-    Entries(Vec<Entry>),
+    Lines(Vec<String>),
 }
 
 /// Stat `path`, read any bytes appended past `state.offset`, and feed them
@@ -86,15 +94,15 @@ pub(crate) fn read_appended(path: &Path, state: &mut TailState) -> ReadResult {
     buf.truncate(n);
     state.offset += n as u64;
 
-    ReadResult::Entries(consume_bytes(state, &buf))
+    ReadResult::Lines(consume_bytes(state, &buf))
 }
 
 /// Apply newly appended bytes to a [`TailState`], returning the parsed entries
 /// from now-complete lines and buffering any trailing partial line.
 ///
 /// Pure over the byte stream so it can be unit-tested without a filesystem.
-pub(crate) fn consume_bytes(state: &mut TailState, appended: &[u8]) -> Vec<Entry> {
-    let mut entries = Vec::new();
+pub(crate) fn consume_bytes(state: &mut TailState, appended: &[u8]) -> Vec<String> {
+    let mut lines = Vec::new();
     let mut start = 0;
 
     for (i, &byte) in appended.iter().enumerate() {
@@ -109,13 +117,13 @@ pub(crate) fn consume_bytes(state: &mut TailState, appended: &[u8]) -> Vec<Entry
             // Complete line = buffered partial + bytes up to (not incl.) '\n'.
             let line_bytes = &appended[start..i];
             if state.partial.is_empty() {
-                if let Some(entry) = parse_bytes(line_bytes) {
-                    entries.push(entry);
+                if let Some(line) = complete_line(line_bytes) {
+                    lines.push(line);
                 }
             } else {
                 state.partial.extend_from_slice(line_bytes);
-                if let Some(entry) = parse_bytes(&state.partial) {
-                    entries.push(entry);
+                if let Some(line) = complete_line(&state.partial) {
+                    lines.push(line);
                 }
                 state.partial.clear();
             }
@@ -133,7 +141,7 @@ pub(crate) fn consume_bytes(state: &mut TailState, appended: &[u8]) -> Vec<Entry
         }
     }
 
-    entries
+    lines
 }
 
 /// `(dev, ino)` for rotation detection; `None` on platforms without inodes.
@@ -149,24 +157,18 @@ fn file_identity(_metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
 }
 
 /// Parse a line given as raw bytes, trimming a trailing `\r` (CRLF tolerance).
-fn parse_bytes(bytes: &[u8]) -> Option<Entry> {
+fn complete_line(bytes: &[u8]) -> Option<String> {
     let bytes = match bytes.last() {
         Some(b'\r') => &bytes[..bytes.len() - 1],
         _ => bytes,
     };
     let line = std::str::from_utf8(bytes).ok()?;
-    transcript::parse_line(line)
+    Some(line.to_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transcript::Entry;
-
-    fn is_user(entry: &Entry) -> bool {
-        matches!(entry, Entry::User(_))
-    }
-
     #[test]
     fn consume_complete_lines() {
         let mut state = TailState::default();
@@ -186,7 +188,7 @@ mod tests {
         // Second chunk completes the line.
         let second = consume_bytes(&mut state, b"er\"}\n");
         assert_eq!(second.len(), 1);
-        assert!(is_user(&second[0]));
+        assert_eq!(second, [r#"{"type":"user"}"#]);
         assert!(state.partial.is_empty());
     }
 
@@ -197,7 +199,7 @@ mod tests {
         assert!(consume_bytes(&mut state, b"pe\":\"system").is_empty());
         let out = consume_bytes(&mut state, b"\"}\n");
         assert_eq!(out.len(), 1);
-        assert!(matches!(out[0], Entry::System(_)));
+        assert_eq!(out, [r#"{"type":"system"}"#]);
     }
 
     #[test]
@@ -225,24 +227,22 @@ mod tests {
         // The next newline resyncs; a following valid line parses normally.
         let out = consume_bytes(&mut state, b"tail-of-garbage\n{\"type\":\"user\"}\n");
         assert_eq!(out.len(), 1, "resynced after the runaway line ended");
-        assert!(is_user(&out[0]));
+        assert_eq!(out, [r#"{"type":"user"}"#]);
     }
 
     #[test]
     fn consume_skips_malformed_lines() {
         let mut state = TailState::default();
-        // A non-JSON line is skipped; the valid one is parsed.
+        // Framing does not interpret provider content.
         let out = consume_bytes(&mut state, b"not json at all\n{\"type\":\"user\"}\n");
-        assert_eq!(out.len(), 1);
-        assert!(is_user(&out[0]));
+        assert_eq!(out, ["not json at all", r#"{"type":"user"}"#]);
     }
 
     #[test]
     fn consume_tolerates_crlf() {
         let mut state = TailState::default();
         let out = consume_bytes(&mut state, b"{\"type\":\"user\"}\r\n");
-        assert_eq!(out.len(), 1);
-        assert!(is_user(&out[0]));
+        assert_eq!(out, [r#"{"type":"user"}"#]);
     }
 
     #[test]
@@ -262,7 +262,7 @@ mod tests {
             f.flush().unwrap();
         }
         let r = read_appended(&tmp, &mut state);
-        assert!(matches!(r, ReadResult::Entries(ref v) if v.is_empty()));
+        assert!(matches!(r, ReadResult::Lines(ref v) if v.is_empty()));
         assert!(!state.partial.is_empty());
 
         // Append the completion.
@@ -273,9 +273,9 @@ mod tests {
         }
         let r = read_appended(&tmp, &mut state);
         match r {
-            ReadResult::Entries(v) => {
+            ReadResult::Lines(v) => {
                 assert_eq!(v.len(), 1);
-                assert!(is_user(&v[0]));
+                assert_eq!(v[0], r#"{"type":"user"}"#);
             }
             _ => panic!("expected entries"),
         }
@@ -305,7 +305,7 @@ mod tests {
                 .unwrap();
         }
         let r = read_appended(&tmp, &mut state);
-        assert!(matches!(r, ReadResult::Entries(ref v) if v.len() == 2));
+        assert!(matches!(r, ReadResult::Lines(ref v) if v.len() == 2));
         assert!(state.offset > 0);
 
         // Truncate to a shorter file → reset.
@@ -320,7 +320,7 @@ mod tests {
 
         // Next read picks up from the start of the new (shorter) file.
         let r = read_appended(&tmp, &mut state);
-        assert!(matches!(r, ReadResult::Entries(ref v) if v.len() == 1));
+        assert!(matches!(r, ReadResult::Lines(ref v) if v.len() == 1));
 
         let _ = std::fs::remove_file(&tmp);
     }
@@ -347,7 +347,7 @@ mod tests {
             f.write_all(b"{\"type\":\"user\"}\n").unwrap();
         }
         let r = read_appended(&tmp, &mut state);
-        assert!(matches!(r, ReadResult::Entries(ref v) if v.len() == 1));
+        assert!(matches!(r, ReadResult::Lines(ref v) if v.len() == 1));
 
         // Replace with a DIFFERENT file (new inode) that is longer than the
         // old offset — the old `len < offset` check alone would read garbage
@@ -367,9 +367,47 @@ mod tests {
 
         // Next read emits the WHOLE new file, not a mid-file suffix.
         let r = read_appended(&tmp, &mut state);
-        assert!(matches!(r, ReadResult::Entries(ref v) if v.len() == 2));
+        assert!(matches!(r, ReadResult::Lines(ref v) if v.len() == 2));
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_identity_detects_same_size_replacement_before_first_tail_read() {
+        use std::io::Write;
+
+        let mut watched = std::env::temp_dir();
+        watched.push(format!(
+            "zoetrope_snapshot_identity_{}.jsonl",
+            std::process::id()
+        ));
+        let mut incoming = std::env::temp_dir();
+        incoming.push(format!(
+            "zoetrope_snapshot_replacement_{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&watched);
+        let _ = std::fs::remove_file(&incoming);
+        std::fs::File::create(&watched)
+            .unwrap()
+            .write_all(b"old-line\n")
+            .unwrap();
+        let metadata = std::fs::metadata(&watched).unwrap();
+        let mut state = TailState::at_snapshot(metadata.len(), Some(&metadata));
+
+        std::fs::File::create(&incoming)
+            .unwrap()
+            .write_all(b"new-line\n")
+            .unwrap();
+        std::fs::rename(&incoming, &watched).unwrap();
+
+        assert!(matches!(
+            read_appended(&watched, &mut state),
+            ReadResult::Reset
+        ));
+        assert_eq!(state.offset, 0);
+        let _ = std::fs::remove_file(&watched);
     }
 
     #[test]
@@ -399,7 +437,7 @@ mod tests {
         // The new file's FIRST line must not be swallowed by the stale
         // overflow skip.
         let r = read_appended(&tmp, &mut state);
-        assert!(matches!(r, ReadResult::Entries(ref v) if v.len() == 1));
+        assert!(matches!(r, ReadResult::Lines(ref v) if v.len() == 1));
 
         let _ = std::fs::remove_file(&tmp);
     }

@@ -46,7 +46,8 @@ pub struct CodexDecoder {
     call_labels: HashMap<String, String>,
     call_spawn_provenance: HashMap<String, SpawnProvenance>,
     latest_context_text: Option<String>,
-    seen_agent_activity: HashSet<(String, ActivityKind)>,
+    seen_agent_activity_ids: HashSet<String>,
+    seen_unidentified_activity: HashSet<(String, ActivityKind, Option<i64>)>,
     last_usage: Option<UsageObservation>,
     usage_revision: u64,
     missing_marker_reported: bool,
@@ -363,6 +364,9 @@ impl CodexDecoder {
                 },
             );
         }
+        let spawn = (category == ToolCategory::AgentSpawn)
+            .then(|| self.call_spawn_provenance.get(&id).cloned())
+            .flatten();
         self.event(
             timestamp,
             EventKind::ToolStarted(ToolStart {
@@ -370,6 +374,7 @@ impl CodexDecoder {
                 name,
                 category,
                 summary,
+                spawn,
             }),
         )
         .into_iter()
@@ -393,6 +398,7 @@ impl CodexDecoder {
             EventKind::ToolFinished(ToolFinish {
                 id,
                 outcome: tool_outcome(output),
+                completes_spawn: false,
             }),
         )
         .into_iter()
@@ -410,13 +416,21 @@ impl CodexDecoder {
         ) else {
             return Vec::new();
         };
-        if !self.seen_agent_activity.insert((agent_id.clone(), kind)) {
-            return Vec::new();
-        }
         let timestamp = activity
             .occurred_at_ms
             .and_then(DateTime::<Utc>::from_timestamp_millis)
             .or(fallback_timestamp);
+        let duplicate = match activity.event_id.as_ref().filter(|id| !id.is_empty()) {
+            Some(event_id) => !self.seen_agent_activity_ids.insert(event_id.clone()),
+            None => !self.seen_unidentified_activity.insert((
+                agent_id.clone(),
+                kind,
+                timestamp.map(|value| value.timestamp_millis()),
+            )),
+        };
+        if duplicate {
+            return Vec::new();
+        }
         match kind {
             ActivityKind::Started => {
                 let Some(parent) = self.actor() else {
@@ -454,8 +468,12 @@ impl CodexDecoder {
                 .into_iter()
                 .collect()
             }
-            ActivityKind::Completed | ActivityKind::Interrupted | ActivityKind::Failed => {
+            ActivityKind::Interacted
+            | ActivityKind::Completed
+            | ActivityKind::Interrupted
+            | ActivityKind::Failed => {
                 let status = match kind {
+                    ActivityKind::Interacted => RecordedAgentStatus::Running,
                     ActivityKind::Completed => RecordedAgentStatus::Completed,
                     ActivityKind::Interrupted => RecordedAgentStatus::Interrupted,
                     ActivityKind::Failed => RecordedAgentStatus::Failed,
@@ -471,7 +489,7 @@ impl CodexDecoder {
                 .into_iter()
                 .collect()
             }
-            ActivityKind::Interacted | ActivityKind::Unknown => Vec::new(),
+            ActivityKind::Unknown => Vec::new(),
         }
     }
 
@@ -936,6 +954,7 @@ mod tests {
                 EventKind::SessionMetadata(metadata) => {
                     format!("session {}", metadata.session.id)
                 }
+                EventKind::Activity => "activity".to_owned(),
                 EventKind::Prompt { text } => format!("prompt {text}"),
                 EventKind::AssistantText { channel, text } => {
                     format!("assistant {channel:?} {text}")
@@ -1221,6 +1240,82 @@ mod tests {
         assert!(
             decoder.finish().is_empty(),
             "the diagnostic is emitted once"
+        );
+    }
+
+    #[test]
+    fn non_adjacent_mirrored_agent_activity_is_deduplicated_by_stable_id() {
+        let text = concat!(
+            r#"{"type":"session_meta","payload":{"id":"root-thread","source":"cli"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"done-1","kind":"completed","agent_thread_id":"child"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"touch-1","kind":"interacted","agent_thread_id":"child"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"done-1","kind":"completed","agent_thread_id":"child"}}"#,
+        );
+        let (_, events) = decode(text);
+        let statuses: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event.kind {
+                EventKind::AgentStatus { status, .. } => Some(status),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            statuses,
+            [RecordedAgentStatus::Completed, RecordedAgentStatus::Running]
+        );
+    }
+
+    #[test]
+    fn distinct_completion_cycles_survive_interacted_transition() {
+        let text = concat!(
+            r#"{"type":"session_meta","payload":{"id":"root-thread","source":"cli"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"done-1","kind":"completed","agent_thread_id":"child"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"touch-1","kind":"interacted","agent_thread_id":"child"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"done-2","kind":"completed","agent_thread_id":"child"}}"#,
+        );
+        let (_, events) = decode(text);
+        let statuses: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event.kind {
+                EventKind::AgentStatus { status, .. } => Some(status),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                RecordedAgentStatus::Completed,
+                RecordedAgentStatus::Running,
+                RecordedAgentStatus::Completed,
+            ]
+        );
+    }
+
+    #[test]
+    fn unidentified_activity_fallback_uses_resolved_timestamp() {
+        let text = concat!(
+            r#"{"type":"session_meta","payload":{"id":"root-thread","source":"cli"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-09-01T10:00:01Z","type":"event_msg","payload":{"type":"sub_agent_activity","kind":"completed","agent_thread_id":"child"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-09-01T10:00:02Z","type":"event_msg","payload":{"type":"sub_agent_activity","kind":"completed","agent_thread_id":"child"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-09-01T10:00:02Z","type":"event_msg","payload":{"type":"sub_agent_activity","kind":"completed","agent_thread_id":"child"}}"#,
+        );
+        let (_, events) = decode(text);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind, EventKind::AgentStatus { .. }))
+                .count(),
+            2,
+            "distinct times survive while an exact no-id mirror is collapsed"
         );
     }
 

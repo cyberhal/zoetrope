@@ -55,7 +55,7 @@ const MIN_NODE_WIDTH: i32 = crate::ui::nodes::CELL_MIN_WIDTH as i32;
 fn ttl(state: ToolState) -> Duration {
     match state {
         ToolState::Err => CHIP_TTL_ERR,
-        ToolState::Pending | ToolState::Ok => CHIP_TTL,
+        ToolState::Pending | ToolState::Ok | ToolState::CompletedUnknown => CHIP_TTL,
     }
 }
 
@@ -394,6 +394,7 @@ pub fn render(
                 " ✗",
                 body_style.fg(palette.error).add_modifier(Modifier::BOLD),
             )),
+            ToolState::CompletedUnknown => Some((" ?", body_style.fg(palette.subtle))),
         };
         let mut cells: Vec<(char, Style)> = body.chars().map(|c| (c, body_style)).collect();
         if let Some((g, gs)) = glyph {
@@ -418,7 +419,7 @@ fn chip_style(state: ToolState, age: Duration, palette: &Palette) -> Style {
         ToolState::Pending => Style::default()
             .fg(palette.accent)
             .add_modifier(Modifier::BOLD),
-        ToolState::Ok => {
+        ToolState::Ok | ToolState::CompletedUnknown => {
             let f = age.as_secs_f64() / CHIP_TTL.as_secs_f64();
             let color = if f < 0.45 {
                 palette.text
@@ -454,6 +455,7 @@ mod tests {
                 id: format!("toolu_{i}"),
                 name: "Bash".into(),
                 summary: None,
+                category: crate::event::ToolCategory::Ordinary,
                 ts: None,
                 end_ts: None,
                 state: ToolState::Pending,
@@ -479,6 +481,7 @@ mod tests {
                 id: format!("toolu_{i}"),
                 name: (*name).into(),
                 summary: None,
+                category: crate::event::ToolCategory::Ordinary,
                 ts: None,
                 end_ts: None,
                 state: ToolState::Pending,

@@ -186,7 +186,7 @@ fn render_header(frame: &mut Frame, area: Rect, agent: &AgentInfo, palette: &rat
     let mut lines: Vec<Line> = Vec::new();
 
     // Title: agent type, bold.
-    let title = agent.agent_type.as_deref().unwrap_or("claude");
+    let title = agent.agent_type.as_deref().unwrap_or("session");
     lines.push(Line::from(Span::styled(
         title,
         bg.fg(palette.text).add_modifier(Modifier::BOLD),
@@ -457,6 +457,7 @@ fn tool_line(
         ToolState::Pending => ('⏳', palette.accent),
         ToolState::Ok => ('✓', palette.success),
         ToolState::Err => ('✗', palette.error),
+        ToolState::CompletedUnknown => ('?', palette.subtle),
     };
     let w = |s: &str| unicode_width::UnicodeWidthStr::width(s);
     let head = format!("{glyph} ");
@@ -569,6 +570,7 @@ mod tests {
                 id: format!("t{i}"),
                 name: "Bash".into(),
                 summary: None,
+                category: crate::event::ToolCategory::Ordinary,
                 ts: Some(ts.parse().unwrap()),
                 end_ts: None,
                 state: ToolState::Ok,
