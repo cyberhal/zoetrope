@@ -1,6 +1,8 @@
 # Slice 02 — Session Catalog and Manifests
 
-Status: implemented on `codex-slice2`; focused and full tests pass on Rust 1.88.
+Status: complete and integrated on `main` as `5579a88`. Its shared identity
+types were consolidated under `event::{Provider, SessionKey}` at the
+integration checkpoint. Focused and full tests pass on Rust 1.88.
 
 Implementation choices: the native catalog owns injected Claude/Codex roots,
 an injectable 64 KiB header limit, and an mtime/length in-memory header cache.
@@ -11,6 +13,20 @@ rollouts outside the configured discovery root. Refresh walks the bounded
 calendar hierarchy so new buckets cannot hide behind stale directory metadata;
 only changed file headers are reread when stable file identity is available,
 and platforms without it conservatively reread each bounded header.
+
+```yaml
+review:
+  pass_id: codex-sessions-02
+  risk: high
+  lane: subagent
+  effort_class: critical
+  session_id: null
+  initial_verdict: findings
+  recheck_count: 1
+```
+
+The directed recheck is clean. The next implementation pickup is Slice 03 on
+the integrated branch.
 
 ## Contract
 

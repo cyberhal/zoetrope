@@ -10,21 +10,10 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::event::{Provider, SessionKey};
 use crate::transcript;
 
 pub const DEFAULT_HEADER_BYTES: usize = 64 * 1024;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum SessionProvider {
-    Claude,
-    Codex,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SessionKey {
-    pub provider: SessionProvider,
-    pub id: String,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionKind {
@@ -190,8 +179,8 @@ impl SessionCatalog {
 
     fn manifest_for(&self, root: SessionRef) -> SessionManifest {
         match root.key.provider {
-            SessionProvider::Claude => claude_manifest(root),
-            SessionProvider::Codex => self.codex_manifest(root),
+            Provider::Claude => claude_manifest(root),
+            Provider::Codex => self.codex_manifest(root),
         }
     }
 
@@ -218,7 +207,7 @@ impl SessionCatalog {
         }
         Some(SessionRef {
             key: SessionKey {
-                provider: SessionProvider::Claude,
+                provider: Provider::Claude,
                 id: name.to_owned(),
             },
             path: path.to_owned(),
@@ -337,7 +326,7 @@ impl SessionCatalog {
                 Some(SyntheticMetadataEvent {
                     child: session.key.clone(),
                     parent: SessionKey {
-                        provider: SessionProvider::Codex,
+                        provider: Provider::Codex,
                         id: parent.clone(),
                     },
                     agent_path: session.agent_path.clone(),
@@ -579,7 +568,7 @@ fn read_codex_header(
         .or(line.payload.agent_path);
     Some(SessionRef {
         key: SessionKey {
-            provider: SessionProvider::Codex,
+            provider: Provider::Codex,
             id: line.payload.id,
         },
         path: path.to_owned(),
@@ -790,7 +779,7 @@ mod tests {
         let mut catalog = SessionCatalog::new(tree.roots());
         let chosen = catalog.latest_for_cwd(Path::new(".")).unwrap();
         assert_eq!(chosen.cwd, Some(cwd));
-        assert_eq!(chosen.key.provider, SessionProvider::Claude);
+        assert_eq!(chosen.key.provider, Provider::Claude);
     }
 
     #[test]
@@ -1007,7 +996,7 @@ mod tests {
         let mut catalog = SessionCatalog::new(tree.roots());
 
         let manifest = catalog.manifest(&WatchTarget::File(path)).unwrap();
-        assert_eq!(manifest.root.key.provider, SessionProvider::Claude);
+        assert_eq!(manifest.root.key.provider, Provider::Claude);
         assert_eq!(manifest.root.cwd, None);
     }
 

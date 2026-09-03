@@ -11,6 +11,15 @@
 - **Verdict:** needs-user — this is a presentation/product choice rather than a correctness requirement. The recommended provisional call is to keep the compact adapter-owned summary because it avoids exposing a provider wire object throughout the core; reversing it only requires replacing the optional summary field before Slice 03 removes the old path.
 - **Confidence:** medium.
 
+### Equal-mtime automatic discovery prefers Codex, then the greater path
+
+- **When:** Slice 02 (`codex-slice2`).
+- **The choice:** If two eligible root families for the same cwd have exactly the same newest filesystem modification time, discovery orders provider-qualified keys deterministically: Codex after Claude, then lexicographically greater paths. The ordinary case still chooses the newest family; explicit files bypass this choice entirely. The unbuilt alternatives are Claude-first or treating an exact tie as ambiguous.
+- **The gap:** The plan requires deterministic cross-provider tie-breaking but deliberately does not choose which provider wins an otherwise indistinguishable tie.
+- **The reach:** This affects only automatic cwd discovery at exact timestamp ties, which can occur with copied fixtures or coarse filesystems. It does not change family eligibility, explicit-file pinning, or normal newest-session behavior.
+- **Verdict:** needs-user — the ordering is a product default rather than a correctness fact. The recommended provisional call is to keep it: it is stable, reversible, and gives the newly supported provider a predictable result without adding a prompt to a read-only launcher.
+- **Confidence:** medium.
+
 ## Sound
 
 ### A result is successful or failed only when its payload provides recognizable evidence
@@ -56,4 +65,49 @@
 - **The gap:** Timestamp semantics were required, but the precedence between the two available Codex timestamps was not stated.
 - **The reach:** Timeline ordering, durations, and nested-agent birth markers inherit this precedence.
 - **Verdict:** sound — the most specific typed event timestamp is stronger evidence than its serialization time, with a defensive fallback when absent or invalid.
+- **Confidence:** high.
+
+### Discovery caps every candidate header read at 64 KiB
+
+- **When:** Slice 02 (`codex-slice2`).
+- **The choice:** The catalog reads no more than 64 KiB from a candidate rollout to obtain its first metadata record. A larger or malformed header is ineligible for automatic discovery but can still be opened explicitly and decoded defensively. The unbuilt alternative is to keep reading until a complete first line appears, which lets one hostile or corrupt file turn discovery into an unbounded history read.
+- **The gap:** The plan requires bounded discovery but leaves the concrete ceiling to implementation.
+- **The reach:** The bound protects every native refresh. Observed valid headers are substantially smaller, and tests pin both the bound and malformed-file behavior.
+- **Verdict:** sound — a fixed generous ceiling enforces the read-only catalog's resource contract without changing valid observed inputs.
+- **Confidence:** high.
+
+### Refresh walks bounded calendar metadata but caches unchanged headers
+
+- **When:** Slice 02 (`codex-slice2`).
+- **The choice:** Each refresh examines the active Codex year/month/day hierarchy so a new bucket cannot be hidden by stale parent-directory metadata. Candidate headers are reread only when their cached file identity changes. The unbuilt alternative is a persistent index or trusting directory mtimes as a recursive change signal.
+- **The gap:** The plan requires discovering newly created day buckets while avoiding full-history reads, but does not prescribe cache invalidation mechanics.
+- **The reach:** Live discovery pays metadata-walk cost proportional to active candidate files, not JSONL body size, while remaining stateless across process launches.
+- **Verdict:** sound — it keeps filesystem truth authoritative and avoids a writable cache with invalidation failure modes.
+- **Confidence:** high.
+
+### Unix replacement detection includes device and inode identity
+
+- **When:** Slice 02 (`codex-slice2`).
+- **The choice:** On Unix, the bounded-header cache key includes device and inode in addition to size and modification time, so replacing a file with the same size and timestamp still invalidates its metadata. Platforms without stable identity conservatively reread bounded headers. The unbuilt alternative is a size/mtime-only cache everywhere.
+- **The gap:** The plan requires safe replacement handling but does not define which portable metadata can prove file continuity.
+- **The reach:** This prevents automatic discovery from retaining another session's stale cwd or parentage after atomic replacement.
+- **Verdict:** sound — it uses stronger evidence where available and fails toward bounded rereads elsewhere.
+- **Confidence:** high.
+
+### An explicit Claude file with no header cwd keeps cwd unknown
+
+- **When:** Slice 02 (`codex-slice2`).
+- **The choice:** Content-sniffed explicit Claude files that do not provide a cwd use `None`; the catalog does not invent the empty path or infer cwd from the filename. The unbuilt alternative is a sentinel path that downstream code could accidentally compare as real provenance.
+- **The gap:** Automatic Claude discovery knows its sanitized project directory, but arbitrary explicit files may not carry equivalent provenance.
+- **The reach:** Explicit replay remains available while cwd filtering and display distinguish unknown metadata from a real directory.
+- **Verdict:** sound — absence stays absence and cannot silently become false provenance.
+- **Confidence:** high.
+
+### Duplicate Claude sidecar identities collapse deterministically
+
+- **When:** Slice 02 (`codex-slice2`).
+- **The choice:** When multiple Claude sidecars describe the same actor or workflow identity, the manifest retains one deterministic file assignment, while the explicitly selected root always remains the root. The unbuilt alternative is to expose duplicate logical actors based on directory iteration order.
+- **The gap:** Existing transcript directories can contain overlapping metadata files, but the model requires stable actor identity independent of enumeration order.
+- **The reach:** Replay and live loading receive one logical source per identity and cannot double-count merely because duplicate sidecars exist.
+- **Verdict:** sound — deterministic de-duplication preserves the manifest's identity contract and explicit-file authority.
 - **Confidence:** high.

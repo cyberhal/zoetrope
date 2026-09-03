@@ -4,9 +4,15 @@ Add first-class Codex session support without weakening Zoetrope's existing Clau
 
 ## Next Agent Prompt
 
-Status: planned, implementation not started. Last updated 2026-09-04.
+Status: Slices 01–02 are integrated on `main`. Last updated 2026-09-04.
 
-You are on `main` at base commit `077707d`; the only expected uncommitted files are this spec until implementation starts. Begin with [Slice 01](slices/01-normalized-events-and-codex-decoder.md). Complete slices in order, update the checklist and decision ledger after every pass, and refresh this handoff after every two or three slices or immediately after a red gate, rebase, compaction, or feature-area change.
+Begin with [Slice 03](slices/03-core-replay-and-inspect.md) from the integrated
+`main`. The normalized event model is the sole owner of provider/session
+identity; do not recreate catalog-local identities or route Codex through a
+Claude-shaped compatibility layer. Complete the remaining slices in order,
+update the checklist and decision ledger after every pass, and refresh this
+handoff after every two or three slices or immediately after a red gate,
+rebase, compaction, or feature-area change.
 
 Inherit these decisions:
 
@@ -21,12 +27,14 @@ Inherit these decisions:
 - Browser scope is one static Codex JSONL; browser directory families and live follow are out of scope.
 - Runtime remains filesystem-read-only and network-free.
 
-Current warning: local `rustc 1.87.0` is below the repository MSRV 1.88, so no implementation slice may be accepted until its Rust gates run on 1.88 or newer. `cargo test --ignore-rust-version` is not a substitute because current dependencies use language features unavailable in 1.87.
+Verification uses an isolated Rust 1.88 toolchain at
+`/private/tmp/zoetrope-rust188`; the system/Homebrew Rust remains 1.87 and is
+not valid evidence for this repository's MSRV.
 
 Global checklist:
 
-- [ ] [Slice 01](slices/01-normalized-events-and-codex-decoder.md): normalized events and stateful Codex decoder
-- [ ] [Slice 02](slices/02-session-catalog-and-manifests.md): bounded cross-provider discovery and manifests
+- [x] [Slice 01](slices/01-normalized-events-and-codex-decoder.md): normalized events and stateful Codex decoder (`153706b`)
+- [x] [Slice 02](slices/02-session-catalog-and-manifests.md): bounded cross-provider discovery and manifests (`5579a88`)
 - [ ] [Slice 03](slices/03-core-replay-and-inspect.md): cut the model, replay, and inspect over to normalized events
 - [ ] [Slice 04](slices/04-codex-families-and-live-follow.md): nested Codex families and live follow
 - [ ] [Slice 05](slices/05-browser-docs-and-integration.md): browser floor, copy/docs, cleanup, and feature-wide review
@@ -106,4 +114,3 @@ The three planning drafts independently agreed on stateful per-file decoding, pr
 - Replay-to-tail handoff, partial writes, rotation/truncation, backward seek, and live/bulk convergence remain exact.
 - Native all-target tests, portable no-default-features tests, wasm check/build, clippy, rustdoc, formatting, and packaging gates pass on Rust 1.88+.
 - Dependency inspection confirms no network runtime was added.
-
