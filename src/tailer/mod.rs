@@ -1,11 +1,10 @@
 //! Background task: live tailing and replay pacing.
 //!
-//! A single tailer task owns ALL files of the watched session. It is poll-based
-//! (200 ms interval, no `notify` dep): each tick it stats every tracked file,
-//! reads appended bytes, splits on `\n`, parses complete lines, and buffers the
-//! trailing partial. It scans `subagents/` and `subagents/workflows/*/` each
-//! tick for newly created files. Replay parses everything up front, merges by
-//! timestamp, and emits wall-clock-paced batches.
+//! A single tailer task owns every file, byte cursor, and decoder in the watched
+//! session. It polls tracked files frequently while throttling manifest/catalog
+//! refreshes; late family members attach from byte zero through the same
+//! provider decoder used by replay. Replay parses everything up front and hands
+//! the merged timeline to the application-owned playhead.
 //!
 //! Everything is stamped with a provider-qualified session key; the UI drops
 //! events whose key is not current (see [`crate::state::App::is_current`]).

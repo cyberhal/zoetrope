@@ -4,16 +4,18 @@ Add first-class Codex session support without weakening Zoetrope's existing Clau
 
 ## Next Agent Prompt
 
-Status: Slices 01–02 are integrated on `main`; Slice 03 is complete on
-`codex-slice3` pending integration. Last updated 2026-09-04.
+Status: Slices 01–03 are integrated on `main` at `ee3027b`; Slice 04 is complete
+and independently reviewed on `codex-slice4`, pending integration. Last updated
+2026-09-04.
 
-After integrating Slice 03, begin with
-[Slice 04](slices/04-codex-families-and-live-follow.md). Preserve the snapshot's
-per-file decoder state and byte identity, and preserve the original
-`WatchTarget` on every reattach. Complete the remaining slices in order,
-update the checklist and decision ledger after every pass, and refresh this
-handoff after every two or three slices or immediately after a red gate,
-rebase, compaction, or feature-area change.
+After integrating Slice 04, begin with
+[Slice 05](slices/05-browser-docs-and-integration.md). Live following now keeps
+one ordered tracker and decoder per manifest file, refreshes Codex families on
+a throttled cadence, and waits for positive replacement evidence on every
+changed file before reloading a fresh family manifest. Preserve the original
+`WatchTarget`, replay speed, parent-first family order, typed child completion
+policy, and exact-reference provenance joins. Complete the final slice, then
+run the feature-wide integration review and closeout.
 
 Inherit these decisions:
 
@@ -36,8 +38,8 @@ Global checklist:
 
 - [x] [Slice 01](slices/01-normalized-events-and-codex-decoder.md): normalized events and stateful Codex decoder (`153706b`)
 - [x] [Slice 02](slices/02-session-catalog-and-manifests.md): bounded cross-provider discovery and manifests (`5579a88`)
-- [x] [Slice 03](slices/03-core-replay-and-inspect.md): cut the model, replay, and inspect over to normalized events (`codex-slice3`, pending integration)
-- [ ] [Slice 04](slices/04-codex-families-and-live-follow.md): nested Codex families and live follow
+- [x] [Slice 03](slices/03-core-replay-and-inspect.md): cut the model, replay, and inspect over to normalized events (`ee3027b`)
+- [x] [Slice 04](slices/04-codex-families-and-live-follow.md): nested Codex families and live follow (`codex-slice4`, clean review, pending integration)
 - [ ] [Slice 05](slices/05-browser-docs-and-integration.md): browser floor, copy/docs, cleanup, and feature-wide review
 
 ## Outcome and observable behavior

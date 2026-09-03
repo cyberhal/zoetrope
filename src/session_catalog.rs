@@ -134,6 +134,49 @@ impl SessionCatalog {
         self.last_stats
     }
 
+    /// Refresh provider indexes once. Live following owns the cadence; this
+    /// catalog owns file eligibility and bounded header caching.
+    pub(crate) fn refresh(&mut self) {
+        self.refresh_codex();
+    }
+
+    pub(crate) fn manifest_for_root(&self, root: &SessionRef) -> SessionManifest {
+        self.manifest_for(root.clone())
+    }
+
+    pub(crate) fn latest_for_cwd_cached(&self, cwd: &Path) -> Option<SessionRef> {
+        let wanted = comparable_path(cwd);
+        let mut candidates = self.claude_candidates(&wanted);
+        candidates.extend(self.codex_root_candidates(&wanted));
+        candidates.into_iter().max_by(candidate_order)
+    }
+
+    /// Whether a replaced tracked file has enough positive provider evidence
+    /// to rebuild its family. Partial and unknown content must keep the old
+    /// snapshot visible until a complete replacement can be classified.
+    pub(crate) fn replacement_ready(&self, path: &Path) -> bool {
+        read_explicit_codex(path, self.header_bytes).is_some()
+            || looks_like_claude(path, self.header_bytes)
+    }
+
+    /// Resolve a replaced root without scanning the Codex history until the
+    /// watched handle has a complete, valid header again.
+    pub(crate) fn replacement_manifest(&mut self, path: &Path) -> Option<SessionManifest> {
+        if let Some(root) = read_explicit_codex(path, self.header_bytes) {
+            self.refresh_codex();
+            let root = self
+                .codex
+                .get(&comparable_path(path))
+                .and_then(|cached| cached.session.clone())
+                .unwrap_or(root);
+            return Some(self.manifest_for(root));
+        }
+        looks_like_claude(path, self.header_bytes)
+            .then(|| self.claude_ref(&comparable_path(path), None))
+            .flatten()
+            .map(claude_manifest)
+    }
+
     pub fn candidates_for_cwd(&mut self, cwd: &Path) -> Vec<SessionRef> {
         self.refresh_codex();
         let wanted = comparable_path(cwd);
@@ -299,8 +342,22 @@ impl SessionCatalog {
             .collect();
         sessions.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.path.cmp(&b.path)));
         sessions.dedup_by(|a, b| a.key == b.key);
-        sessions.push(root.clone());
-        sessions.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.path.cmp(&b.path)));
+        let parent_by_id: HashMap<_, _> = sessions
+            .iter()
+            .filter_map(|session| {
+                session
+                    .parent_thread_id
+                    .as_ref()
+                    .map(|parent| (session.key.id.clone(), parent.clone()))
+            })
+            .collect();
+        sessions.sort_by(|a, b| {
+            family_depth(a, &root.key.id, &parent_by_id)
+                .cmp(&family_depth(b, &root.key.id, &parent_by_id))
+                .then_with(|| a.key.cmp(&b.key))
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        sessions.insert(0, root.clone());
         let files = sessions
             .iter()
             .map(|session| ManifestFile {
@@ -346,6 +403,28 @@ impl SessionCatalog {
             .filter_map(|cached| cached.session.as_ref())
             .collect()
     }
+}
+
+fn family_depth(
+    session: &SessionRef,
+    root_id: &str,
+    parent_by_id: &HashMap<String, String>,
+) -> usize {
+    let mut depth = 1;
+    let mut parent = session.parent_thread_id.as_deref();
+    while let Some(id) = parent {
+        if id == root_id {
+            return depth;
+        }
+        depth += 1;
+        if depth > parent_by_id.len() + 1 {
+            break;
+        }
+        parent = parent_by_id.get(id).map(String::as_str);
+    }
+    // The family closure excludes disconnected chains; this is only a
+    // defensive deterministic fallback for malformed cyclic ancestry.
+    usize::MAX
 }
 
 fn family_ids(sessions: &[&SessionRef], root_id: &str) -> HashSet<String> {
@@ -908,9 +987,16 @@ mod tests {
                 .iter()
                 .map(|file| file.session.as_ref().unwrap().id.as_str())
                 .collect::<Vec<_>>(),
-            ["child", "grandchild", "root"]
+            ["root", "child", "grandchild"]
         );
-        assert_eq!(manifest.metadata.len(), 2);
+        assert_eq!(
+            manifest
+                .metadata
+                .iter()
+                .map(|metadata| metadata.child.id.as_str())
+                .collect::<Vec<_>>(),
+            ["child", "grandchild"]
+        );
 
         let pinned = catalog.manifest(&WatchTarget::File(child_path)).unwrap();
         assert_eq!(pinned.root.key.id, "child");

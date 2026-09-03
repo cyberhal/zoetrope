@@ -198,6 +198,10 @@ pub struct ToolFinish {
     /// Whether this completion is also evidence that a synchronously spawned
     /// child finished. Provider adapters decide this semantic distinction.
     pub completes_spawn: bool,
+    /// Exact provider-recorded reference returned by a spawn call, when one
+    /// exists. Family assembly may join this to a child header without
+    /// exposing provider output shapes to consumers.
+    pub spawn_reference: Option<String>,
 }
 
 /// What a result record proves about the invocation.
@@ -215,11 +219,24 @@ pub struct AgentDescriptor {
     pub id: ActorId,
     pub parent: ActorId,
     pub spawn: SpawnProvenance,
+    /// Exact structural path/reference from the child header, when available.
+    /// This is distinct from a presentation label and may join a spawn result.
+    pub spawn_reference: Option<String>,
+    pub completion_policy: AgentCompletionPolicy,
     pub role: AgentRole,
     pub label: Option<String>,
     pub agent_type: Option<String>,
     pub description: Option<String>,
     pub interactive: bool,
+}
+
+/// What evidence may transition a spawned actor to a terminal state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentCompletionPolicy {
+    /// Only a typed lifecycle fact may complete or interrupt the actor.
+    ExplicitLifecycle,
+    /// Silence/end-of-stream inference preserves a provider's legacy format.
+    InferFromSilence,
 }
 
 /// Provider-normalized context for the call that caused an agent to exist.

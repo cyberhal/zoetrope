@@ -1,5 +1,50 @@
 # Slice 04 — Codex Families and Live Follow
 
+Status: complete on `codex-slice4`, pending integration. Live sessions retain
+the original watch intent, current manifest, ordered file trackers, per-file
+decoder/byte identity, emitted structural metadata, replay speed, refresh
+cadence, and reset state. Late direct and nested Codex rollouts attach from byte
+zero exactly once; active Claude watches refresh local manifests without
+walking Codex history. Replacement/truncation discards that tick, waits for a
+valid provider record/header for every changed path, then emits one reset plus
+one complete snapshot from the freshly resolved manifest without mixing old
+and new families. Codex descendants are emitted parent-first by ancestry depth.
+
+Codex children use explicit lifecycle completion: silence or finite EOF may
+make an uncompleted child idle, but never terminal. Spawn provenance joins by
+stable call/activity id, then by a unique exact output/header reference; an
+ambiguous reference remains unlinked, and a header-only parent edge invents no
+call context.
+
+Verification on Rust 1.88 covers late/nested attachment and follow-up appends,
+copied-prefix suppression, partial/malformed activity, live/bulk convergence,
+throttled discovery, cross-provider quiet switching, explicit pinning,
+root and child replacement/truncation/rotation, missing-child reappearance,
+retryable Claude metadata, lifecycle cycles, and provenance arrival orders.
+The full native suite passes 246 library and 8 binary tests; the portable suite
+passes 180 tests. Formatting, strict clippy, rustdoc warnings-as-errors,
+portable check, inspect smokes, package verification, and dependency inspection
+are clean.
+
+```yaml
+review:
+  pass_id: codex-sessions-04
+  risk: high
+  lane: subagent
+  effort_class: critical
+  session_id: null
+  initial_verdict: findings
+  recheck_count: 1
+```
+
+The initial review found one high-risk child-replacement family leak and two
+medium-risk ordering issues at the Claude idle-scan boundary and nested family
+discovery. The same reviewer confirmed all fixes, the reverse-lexical graph
+case, missing-child reappearance, and nested append behavior, and returned a
+clean verdict. It judged the focused model-observable live/bulk convergence
+comparison sufficient alongside the adjacent lifecycle, provenance, decoder,
+and exact-once tests.
+
 ## Contract
 
 A Codex root plus late-arriving direct/nested child rollouts becomes one live graph, and directory watches switch between providers only under the existing idle policy. No byte is lost or delivered twice at snapshot/tail boundaries.
@@ -44,4 +89,3 @@ cargo test --all-targets
 Provisional tier: high. The exact risks are false graphs, wrong-session switches, and replay/live gaps. Scheduling and cache data structures are delegated; delivery, pinning, eligibility, and lifecycle semantics are locked.
 
 Must stay green: all existing live invariants and Claude auto-switch behavior.
-

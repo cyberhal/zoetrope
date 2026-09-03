@@ -8,10 +8,10 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 
 use crate::event::{
-    ActorId, AgentDescriptor, AgentMetadataPatch, AgentRole, AssistantChannel, EventKind,
-    EventTime, Provider, RecordedAgentStatus, SessionEvent, SessionInfoPatch, SessionKey,
-    SessionMetadata, SessionOrigin, SpawnProvenance, ToolCategory, ToolFinish, ToolOutcome,
-    ToolStart, UsageObservation, WorkflowDescriptor,
+    ActorId, AgentCompletionPolicy, AgentDescriptor, AgentMetadataPatch, AgentRole,
+    AssistantChannel, EventKind, EventTime, Provider, RecordedAgentStatus, SessionEvent,
+    SessionInfoPatch, SessionKey, SessionMetadata, SessionOrigin, SpawnProvenance, ToolCategory,
+    ToolFinish, ToolOutcome, ToolStart, UsageObservation, WorkflowDescriptor,
 };
 use crate::transcript::{
     self, AgentToolInput, ContentBlock, Entry, FlatValueEntry, UserContent, UserContentBlock,
@@ -349,6 +349,7 @@ impl ClaudeDecoder {
                                 ToolOutcome::Succeeded
                             },
                             completes_spawn: true,
+                            spawn_reference: None,
                         }),
                     ));
                 }
@@ -402,6 +403,8 @@ pub fn decode_subagent_metadata(
                     time: EventTime::AtAgentStart(ActorId(agent_id.to_owned())),
                     preceding_context: None,
                 },
+                spawn_reference: None,
+                completion_policy: AgentCompletionPolicy::InferFromSilence,
                 role: AgentRole::WorkflowGroup,
                 label: None,
                 agent_type: None,
@@ -423,6 +426,8 @@ pub fn decode_subagent_metadata(
             id: ActorId(agent_id.to_owned()),
             parent,
             spawn: spawn.clone(),
+            spawn_reference: None,
+            completion_policy: AgentCompletionPolicy::InferFromSilence,
             role: AgentRole::Subagent,
             label: meta.agent_type.clone(),
             agent_type: meta.agent_type.clone(),

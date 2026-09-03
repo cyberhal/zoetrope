@@ -67,8 +67,9 @@ pub(crate) async fn run_replay(
         manifest,
         snapshot.tracked,
         snapshot.pending_metadata,
+        if speed > 0.0 { speed } else { 1.0 },
     );
-    tail_loop(live, session, ui_tx, req_rx).await
+    tail_loop(live, ui_tx, req_rx).await
 }
 
 #[cfg(test)]

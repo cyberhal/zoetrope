@@ -506,6 +506,8 @@ mod tests {
                             time: EventTime::At(timestamp),
                             preceding_context: None,
                         },
+                        spawn_reference: None,
+                        completion_policy: crate::event::AgentCompletionPolicy::InferFromSilence,
                         role: crate::event::AgentRole::Subagent,
                         label: None,
                         agent_type: None,

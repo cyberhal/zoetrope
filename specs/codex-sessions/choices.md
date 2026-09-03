@@ -40,6 +40,33 @@
 
 ## Sound
 
+### Replacement commits only after positive content and fresh family evidence
+
+- **When:** Slice 04 (`codex-slice4`).
+- **The choice:** A reset records every changed path and waits until each has a complete recognizable Claude record or Codex header. The subsequent full reload trusts the freshly resolved manifest; a known non-root file omitted from it is retained only while the path is missing or unreadable, never when readable content now belongs to another family.
+- **The gap:** The live contract required both transient-file retention and family isolation but did not specify how to distinguish a temporarily unavailable child from a path reused by another rollout.
+- **The reach:** Partial replacements emit no stale-key snapshot, restored files retry safely, and an atomically replaced child cannot import another session into the current graph.
+- **Verdict:** sound — positive content proves readiness while the catalog remains the sole owner of family eligibility.
+- **Confidence:** high.
+
+### Codex family order is ancestry depth, then stable identity
+
+- **When:** Slice 04 (`codex-slice4`).
+- **The choice:** A manifest emits the root first, then spawned descendants by ancestry depth, with provider-qualified key and path as deterministic sibling tie-breakers.
+- **The gap:** Path or key order is deterministic but not topological; a lexically early grandchild can otherwise be inserted before its parent and receive fallback graph placement.
+- **The reach:** Snapshot and late-family synthetic discovery create every parent before its children without making the graph inspect provider metadata.
+- **Verdict:** sound — topology is a manifest concern, while sibling order remains stable and reproducible.
+- **Confidence:** high.
+
+### Spawn-result references are exact, unique structural evidence
+
+- **When:** Slice 04 (`codex-slice4`).
+- **The choice:** A Codex spawn result may name the child it launched using the observed `task_name` or `path` field. The adapter retains only that exact string, and the model links it to a child header only when exactly one spawning call under the same parent returned the same string. If two calls both return `/root/worker`, neither is guessed to be the child’s call; a later stable activity id can still make the exact join. An arbitrary message mentioning `/root/worker` is not treated as structural evidence.
+- **The gap:** The plan orders path evidence below stable call ids but does not define which result fields count as an exact path or what happens when an exact value is not unique.
+- **The reach:** Child provenance, prompt attribution, and spawn completion joins remain independent of file arrival order without exposing provider result JSON to the model or manufacturing context from a plausible string.
+- **Verdict:** sound — a unique exact field is useful evidence, while ambiguity and prose both fail closed.
+- **Confidence:** high.
+
 ### Spawn provenance merges by evidence strength rather than arrival order
 
 - **When:** Slice 03 (`codex-slice3`).

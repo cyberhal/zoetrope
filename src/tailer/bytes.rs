@@ -57,8 +57,12 @@ pub(crate) enum ReadResult {
 pub(crate) fn read_appended(path: &Path, state: &mut TailState) -> ReadResult {
     use std::io::{Read, Seek, SeekFrom};
 
-    let metadata = match std::fs::metadata(path) {
-        Ok(m) => m,
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return ReadResult::Missing,
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
         Err(_) => return ReadResult::Missing,
     };
     let len = metadata.len();
@@ -78,10 +82,6 @@ pub(crate) fn read_appended(path: &Path, state: &mut TailState) -> ReadResult {
     }
     state.identity = identity;
 
-    let mut file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return ReadResult::Missing,
-    };
     if file.seek(SeekFrom::Start(state.offset)).is_err() {
         return ReadResult::Missing;
     }

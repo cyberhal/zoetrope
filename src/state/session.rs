@@ -12,20 +12,26 @@ use std::collections::{BTreeMap, HashMap};
 use chrono::{DateTime, Utc};
 
 use crate::event::{
-    ActorId, AgentMetadataPatch, AgentRole, EventKind, EventTime, RecordedAgentStatus,
-    SessionEvent, SessionKey, ToolCategory, ToolFinish, ToolOutcome, ToolStart, UsageObservation,
-    WorkflowDescriptor,
+    ActorId, AgentCompletionPolicy, AgentMetadataPatch, AgentRole, EventKind, EventTime,
+    RecordedAgentStatus, SessionEvent, SessionKey, ToolCategory, ToolFinish, ToolOutcome,
+    ToolStart, UsageObservation, WorkflowDescriptor,
 };
 
 /// Stable node id of the main (root) agent.
 pub const MAIN_ID: &str = "main";
 type ToolFinishKey = (String, String);
-type TimedToolOutcome = (ToolOutcome, Option<DateTime<Utc>>);
+type TimedToolOutcome = (ToolOutcome, Option<DateTime<Utc>>, Option<String>);
 
 #[derive(Clone, Copy)]
 struct LifecycleFact {
     timestamp: Option<DateTime<Utc>>,
     status: AgentStatus,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SpawnLinkStrength {
+    ExactReference,
+    StableCallId,
 }
 
 /// Silence window after which an interactive sidechain (fork) is shown as
@@ -73,6 +79,12 @@ pub struct SessionModel {
     /// Metadata may arrive before structural discovery; retain it without
     /// fabricating a node.
     pending_agent_metadata: HashMap<String, AgentMetadataPatch>,
+    /// Exact spawn-result references and unresolved child headers are retained
+    /// so either side may arrive first. Ambiguous references never invent a
+    /// call relationship.
+    spawn_references: BTreeMap<(String, String), Vec<String>>,
+    child_spawn_references: BTreeMap<String, (String, String)>,
+    spawn_link_strength: HashMap<String, SpawnLinkStrength>,
     /// Every plain user prompt in the main transcript, in order — the
     /// session's spine. Tool calls and spawns attribute to a prompt era via
     /// [`Self::prompt_for_ts`] (timestamp-derived, order-independent).
@@ -241,6 +253,7 @@ pub struct AgentInfo {
     /// (`kind == Main`) or when the meta reveals a fork — never re-derived
     /// from strings at call sites.
     interactive: bool,
+    completion_policy: AgentCompletionPolicy,
     /// e.g. `"claude-code-guide"`, `"workflow-subagent"`.
     pub agent_type: Option<String>,
     /// From `meta.description` or the `Agent` tool_use `input.description`.
@@ -280,6 +293,7 @@ impl AgentInfo {
         AgentInfo {
             kind,
             interactive: kind == AgentKind::Main,
+            completion_policy: AgentCompletionPolicy::InferFromSilence,
             agent_type: None,
             description: None,
             parent: None,
@@ -354,6 +368,9 @@ impl SessionModel {
             recorded_lifecycle: HashMap::new(),
             spawn_context: HashMap::new(),
             pending_agent_metadata: HashMap::new(),
+            spawn_references: BTreeMap::new(),
+            child_spawn_references: BTreeMap::new(),
+            spawn_link_strength: HashMap::new(),
             prompts: Vec::new(),
             #[cfg(test)]
             test_claude_decoders: HashMap::new(),
@@ -585,9 +602,10 @@ impl SessionModel {
         let orphan = self
             .orphan_tool_finishes
             .remove(&(actor.to_owned(), tool.id.clone()));
-        let (state, end_ts) = orphan.map_or((ToolState::Pending, None), |(outcome, end)| {
-            (tool_state(outcome), end)
-        });
+        let (state, end_ts, spawn_reference) = orphan.map_or(
+            (ToolState::Pending, None, None),
+            |(outcome, end, reference)| (tool_state(outcome), end, reference),
+        );
         agent
             .tool_index
             .insert(tool.id.clone(), agent.tool_calls.len());
@@ -610,6 +628,11 @@ impl SessionModel {
                 2,
             );
         }
+        if let Some(reference) = spawn_reference {
+            self.record_spawn_reference(actor, &tool.id, tool.category, reference);
+        } else if tool.category == ToolCategory::AgentSpawn {
+            self.reconcile_child_references(actor);
+        }
     }
 
     fn finish_tool(&mut self, actor: &str, ts: Option<DateTime<Utc>>, finish: &ToolFinish) {
@@ -619,8 +642,21 @@ impl SessionModel {
             agent.tool_calls[index].state = tool_state(finish.outcome);
             agent.tool_calls[index].end_ts = ts;
         } else {
-            self.orphan_tool_finishes
-                .insert((actor.to_owned(), finish.id.clone()), (finish.outcome, ts));
+            self.orphan_tool_finishes.insert(
+                (actor.to_owned(), finish.id.clone()),
+                (finish.outcome, ts, finish.spawn_reference.clone()),
+            );
+        }
+        if let Some(reference) = &finish.spawn_reference {
+            let category = self.agents.get(actor).and_then(|agent| {
+                agent
+                    .tool_index
+                    .get(&finish.id)
+                    .map(|index| agent.tool_calls[*index].category)
+            });
+            if let Some(category) = category {
+                self.record_spawn_reference(actor, &finish.id, category, reference.clone());
+            }
         }
         if actor == MAIN_ID && finish.completes_spawn {
             self.completed_spawns
@@ -654,22 +690,37 @@ impl SessionModel {
             AgentRole::Subagent => AgentKind::Subagent,
             AgentRole::WorkflowGroup => AgentKind::WorkflowGroup,
         };
-        let structural = self.ensure_agent(&id, kind);
         let parent = self.logical_actor(&descriptor.parent);
+        let direct_call = descriptor.spawn.tool_call_id.clone();
+        let matched_call = direct_call
+            .clone()
+            .or_else(|| self.unique_spawn_call(&parent, descriptor.spawn_reference.as_deref()?));
+        let structural = self.ensure_agent(&id, kind);
         if let Some(agent) = self.agents.get_mut(&id) {
-            agent.parent.get_or_insert(parent);
+            agent.parent.get_or_insert(parent.clone());
             agent.interactive = descriptor.interactive;
+            agent.completion_policy = descriptor.completion_policy;
             if agent.agent_type.is_none() {
                 agent.agent_type = descriptor.agent_type.clone().or(descriptor.label.clone());
             }
             if agent.description.is_none() {
                 agent.description = descriptor.description.clone();
             }
-            if agent.spawned_by_tool_use.is_none() {
-                agent.spawned_by_tool_use = descriptor.spawn.tool_call_id.clone();
+            if direct_call.is_some()
+                || (agent.spawned_by_tool_use.is_none() && matched_call.is_some())
+            {
+                agent.spawned_by_tool_use = matched_call.clone();
             }
         }
-        if let Some(call_id) = &descriptor.spawn.tool_call_id {
+        if direct_call.is_some() {
+            self.spawn_link_strength
+                .insert(id.clone(), SpawnLinkStrength::StableCallId);
+        } else if matched_call.is_some() {
+            self.spawn_link_strength
+                .entry(id.clone())
+                .or_insert(SpawnLinkStrength::ExactReference);
+        }
+        if let Some(call_id) = &matched_call {
             self.record_spawn_context(
                 call_id,
                 SpawnContext {
@@ -679,12 +730,92 @@ impl SessionModel {
                 1,
             );
         }
+        if direct_call.is_some() {
+            self.child_spawn_references.remove(&id);
+        } else if self.spawn_link_strength.get(&id).copied()
+            != Some(SpawnLinkStrength::StableCallId)
+            && let Some(reference) = &descriptor.spawn_reference
+        {
+            self.child_spawn_references
+                .insert(id.clone(), (parent, reference.clone()));
+        }
         if let Some(metadata) = self.pending_agent_metadata.remove(&id) {
             self.apply_agent_metadata(&metadata);
         }
         self.label_workflow_group(&id);
         self.resolve_spawn_status(&id);
         structural
+    }
+
+    fn record_spawn_reference(
+        &mut self,
+        actor: &str,
+        call_id: &str,
+        category: ToolCategory,
+        reference: String,
+    ) {
+        if category != ToolCategory::AgentSpawn {
+            return;
+        }
+        let calls = self
+            .spawn_references
+            .entry((actor.to_owned(), reference))
+            .or_default();
+        if !calls.iter().any(|known| known == call_id) {
+            calls.push(call_id.to_owned());
+            calls.sort();
+        }
+        self.reconcile_child_references(actor);
+    }
+
+    fn unique_spawn_call(&self, parent: &str, reference: &str) -> Option<String> {
+        let calls = self
+            .spawn_references
+            .get(&(parent.to_owned(), reference.to_owned()))?;
+        (calls.len() == 1).then(|| calls[0].clone())
+    }
+
+    fn reconcile_child_references(&mut self, parent: &str) {
+        let pending: Vec<_> = self
+            .child_spawn_references
+            .iter()
+            .filter(|(_, (known_parent, _))| known_parent == parent)
+            .map(|(child, (known_parent, reference))| {
+                (child.clone(), known_parent.clone(), reference.clone())
+            })
+            .collect();
+        for (child, known_parent, reference) in pending {
+            if self.spawn_link_strength.get(&child).copied()
+                == Some(SpawnLinkStrength::StableCallId)
+            {
+                continue;
+            }
+            let matched = self.unique_spawn_call(&known_parent, &reference);
+            let ambiguous_calls = self
+                .spawn_references
+                .get(&(known_parent, reference))
+                .cloned()
+                .unwrap_or_default();
+            if let Some(agent) = self.agents.get_mut(&child) {
+                match matched {
+                    Some(call_id) if agent.spawned_by_tool_use.is_none() => {
+                        agent.spawned_by_tool_use = Some(call_id);
+                        self.spawn_link_strength
+                            .insert(child.clone(), SpawnLinkStrength::ExactReference);
+                    }
+                    None if agent
+                        .spawned_by_tool_use
+                        .as_ref()
+                        .is_some_and(|call| ambiguous_calls.contains(call)) =>
+                    {
+                        agent.spawned_by_tool_use = None;
+                        self.spawn_link_strength.remove(&child);
+                    }
+                    _ => {}
+                }
+            }
+            self.resolve_spawn_status(&child);
+        }
     }
 
     fn apply_agent_metadata(&mut self, metadata: &AgentMetadataPatch) {
@@ -900,7 +1031,7 @@ impl SessionModel {
 
     /// Re-derive time-based liveness from each agent's own activity.
     ///
-    /// Two families, both inferred from `last_ts` vs `reference` (the wall clock
+    /// Three policies, inferred from `last_ts` vs `reference` (the wall clock
     /// live, or `None` → the session's `last_activity` in replay, keeping replay
     /// deterministic on the recorded timeline):
     ///
@@ -908,13 +1039,13 @@ impl SessionModel {
     ///   format, so `Running` within `INTERACTIVE_IDLE_SECS` of `reference`,
     ///   else `Idle` — never `Done`/`Failed` (unclaimable). Reversible: new
     ///   activity flips it back to `Running`.
-    /// - **Subagents**: they DO terminate, but the `Agent` tool result is only a
-    ///   spawn ack ("Async agent launched successfully"), not a completion. So a
-    ///   subagent with no reliable completion on record has its liveness derived
-    ///   from its OWN activity: `Running` while active, `Done` once quiet. A
-    ///   reliable completion already recorded (`Done`/`Failed`/`Stopped` from an
-    ///   async `<task-notification>`, a non-superseded ack, or a workflow journal
-    ///   `result`) is terminal — only a still-`Running` subagent is refined here.
+    /// - **Explicit-lifecycle subagents**: `Running` while active, else `Idle`.
+    ///   Silence is never promoted to completion; only a typed lifecycle fact
+    ///   can make these agents terminal.
+    /// - **Legacy inferred subagents**: `Running` while active, `Done` once
+    ///   quiet. A reliable completion already recorded (`Done`/`Failed`/`Stopped`
+    ///   from an async `<task-notification>`, a non-superseded ack, or a workflow
+    ///   journal `result`) is terminal and short-circuits this fallback.
     ///
     /// "Active" is transcript activity within the window OR an unresolved
     /// (`Pending`) tool_call: a tool in flight is direct proof the agent is
@@ -953,6 +1084,12 @@ impl SessionModel {
             } else if agent.terminal {
                 // A reliably-completed subagent (sync ack / journal) is terminal.
                 agent.status
+            } else if agent.completion_policy == AgentCompletionPolicy::ExplicitLifecycle {
+                if active {
+                    AgentStatus::Running
+                } else {
+                    AgentStatus::Idle
+                }
             } else if active {
                 // Async agent still producing activity — and REVERSIBLE: a long
                 // gap (e.g. a subagent running `cargo test`) that settled it to
@@ -967,14 +1104,18 @@ impl SessionModel {
         changed
     }
 
-    /// Mark the end of a finite stream (replay finished): every interactive
-    /// agent goes `Idle` — the recording is over, nothing is active, and
-    /// completion remains unclaimable.
+    /// Mark the end of a finite stream (replay finished). Interactive and
+    /// explicit-lifecycle nonterminal agents go `Idle`; legacy inferred
+    /// subagents may settle to `Done`.
     pub fn end_of_stream(&mut self) {
         for agent in self.agents.values_mut() {
             if agent.is_interactive() {
                 // Interactive agents (main/forks) never "complete" — the stream
                 // ending just means they went quiet.
+                agent.status = AgentStatus::Idle;
+            } else if !agent.terminal
+                && agent.completion_policy == AgentCompletionPolicy::ExplicitLifecycle
+            {
                 agent.status = AgentStatus::Idle;
             } else if agent.status == AgentStatus::Running {
                 // A subagent still Running at the recording's end has finished
@@ -1301,6 +1442,7 @@ mod tests {
             id: "call".into(),
             outcome: ToolOutcome::CompletedUnknown,
             completes_spawn: false,
+            spawn_reference: None,
         })));
         assert_eq!(
             model.agent(MAIN_ID).unwrap().tool_calls[0].state,
@@ -1320,6 +1462,8 @@ mod tests {
                     time: EventTime::Untimed,
                     preceding_context: None,
                 },
+                spawn_reference: None,
+                completion_policy: AgentCompletionPolicy::ExplicitLifecycle,
                 role: AgentRole::Subagent,
                 label: None,
                 agent_type: None,
@@ -1401,11 +1545,190 @@ mod tests {
             id: "spawn".into(),
             outcome: ToolOutcome::Succeeded,
             completes_spawn: false,
+            spawn_reference: None,
         })));
         model.apply_event(&discovered_child());
         let child = model.agent("child").unwrap();
         assert_eq!(child.status, AgentStatus::Running);
         assert!(!child.terminal);
+    }
+
+    #[test]
+    fn explicit_lifecycle_child_never_infers_completion_from_silence_or_eof() {
+        let mut model = SessionModel::new(SessionKey {
+            provider: Provider::Codex,
+            id: "neutral-session".into(),
+        });
+        model.apply_event(&discovered_child());
+        model.apply_event(&lifecycle(
+            RecordedAgentStatus::Running,
+            "2026-09-01T10:00:00Z",
+        ));
+        model.recompute_liveness(Some("2026-09-01T11:00:00Z".parse().unwrap()));
+        let child = model.agent("child").unwrap();
+        assert_eq!(child.status, AgentStatus::Idle);
+        assert!(!child.terminal);
+        model.end_of_stream();
+        let child = model.agent("child").unwrap();
+        assert_eq!(child.status, AgentStatus::Idle);
+        assert!(!child.terminal);
+
+        model.apply_event(&lifecycle(
+            RecordedAgentStatus::Completed,
+            "2026-09-01T11:00:01Z",
+        ));
+        let child = model.agent("child").unwrap();
+        assert_eq!(child.status, AgentStatus::Done);
+        assert!(child.terminal);
+    }
+
+    fn spawn_start(id: &str) -> SessionEvent {
+        neutral(EventKind::ToolStarted(ToolStart {
+            id: id.into(),
+            name: "spawn_agent".into(),
+            category: ToolCategory::AgentSpawn,
+            summary: None,
+            spawn: Some(SpawnProvenance {
+                tool_call_id: Some(id.into()),
+                time: EventTime::Untimed,
+                preceding_context: Some(format!("context for {id}")),
+            }),
+        }))
+    }
+
+    fn spawn_finish(id: &str, reference: &str) -> SessionEvent {
+        neutral(EventKind::ToolFinished(ToolFinish {
+            id: id.into(),
+            outcome: ToolOutcome::CompletedUnknown,
+            completes_spawn: false,
+            spawn_reference: Some(reference.into()),
+        }))
+    }
+
+    fn header_child(id: &str, reference: &str) -> SessionEvent {
+        neutral(EventKind::AgentDiscovered(AgentDescriptor {
+            id: ActorId::from(id),
+            parent: ActorId::from("neutral-session"),
+            spawn: SpawnProvenance {
+                tool_call_id: None,
+                time: EventTime::Untimed,
+                preceding_context: None,
+            },
+            spawn_reference: Some(reference.into()),
+            completion_policy: AgentCompletionPolicy::ExplicitLifecycle,
+            role: AgentRole::Subagent,
+            label: Some(reference.into()),
+            agent_type: None,
+            description: None,
+            interactive: false,
+        }))
+    }
+
+    #[test]
+    fn exact_spawn_reference_joins_in_both_arrival_orders() {
+        for events in [
+            vec![
+                header_child("child", "/root/child"),
+                spawn_start("call"),
+                spawn_finish("call", "/root/child"),
+            ],
+            vec![
+                spawn_finish("call", "/root/child"),
+                spawn_start("call"),
+                header_child("child", "/root/child"),
+            ],
+        ] {
+            let mut model = SessionModel::new(SessionKey {
+                provider: Provider::Codex,
+                id: "neutral-session".into(),
+            });
+            for event in events {
+                model.apply_event(&event);
+            }
+            let child = model.agent("child").unwrap();
+            assert_eq!(child.spawned_by_tool_use.as_deref(), Some("call"));
+            assert_eq!(
+                model.provenance(child).unwrap().reasoning.as_deref(),
+                Some("context for call")
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_spawn_reference_removes_fallback_without_invented_context() {
+        let mut model = SessionModel::new(SessionKey {
+            provider: Provider::Codex,
+            id: "neutral-session".into(),
+        });
+        for event in [
+            header_child("child", "/root/same"),
+            spawn_start("call-a"),
+            spawn_finish("call-a", "/root/same"),
+            spawn_start("call-b"),
+            spawn_finish("call-b", "/root/same"),
+        ] {
+            model.apply_event(&event);
+        }
+        let child = model.agent("child").unwrap();
+        assert_eq!(child.spawned_by_tool_use, None);
+        assert!(model.provenance(child).is_none());
+    }
+
+    #[test]
+    fn stable_activity_id_survives_later_ambiguous_path_evidence() {
+        let mut model = SessionModel::new(SessionKey {
+            provider: Provider::Codex,
+            id: "neutral-session".into(),
+        });
+        for event in [
+            discovered_child(),
+            header_child("child", "/root/same"),
+            spawn_start("spawn"),
+            spawn_finish("spawn", "/root/same"),
+            spawn_start("other"),
+            spawn_finish("other", "/root/same"),
+        ] {
+            model.apply_event(&event);
+        }
+        assert_eq!(
+            model.agent("child").unwrap().spawned_by_tool_use.as_deref(),
+            Some("spawn")
+        );
+    }
+
+    #[test]
+    fn child_header_enriches_activity_placeholder_without_duplicate_node() {
+        let mut model = SessionModel::new(SessionKey {
+            provider: Provider::Codex,
+            id: "neutral-session".into(),
+        });
+        model.apply_event(&discovered_child());
+        model.apply_event(&header_child("child", "/root/child"));
+        assert_eq!(
+            model
+                .spawn_order
+                .iter()
+                .filter(|id| id.as_str() == "child")
+                .count(),
+            1
+        );
+        assert_eq!(
+            model.agent("child").unwrap().agent_type.as_deref(),
+            Some("/root/child")
+        );
+    }
+
+    #[test]
+    fn header_parent_fallback_creates_structure_without_call_context() {
+        let mut model = SessionModel::new(SessionKey {
+            provider: Provider::Codex,
+            id: "neutral-session".into(),
+        });
+        model.apply_event(&header_child("child", "/root/unmatched"));
+        let child = model.agent("child").unwrap();
+        assert_eq!(child.parent.as_deref(), Some(MAIN_ID));
+        assert_eq!(child.spawned_by_tool_use, None);
+        assert!(model.provenance(child).is_none());
     }
 
     #[test]

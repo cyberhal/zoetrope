@@ -12,9 +12,10 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::event::{
-    ActorId, AgentDescriptor, AgentRole, AssistantChannel, EventKind, EventTime, Provider,
-    RecordedAgentStatus, SessionEvent, SessionKey, SessionMetadata, SessionOrigin, SpawnProvenance,
-    ToolCategory, ToolFinish, ToolOutcome, ToolStart, UsageObservation,
+    ActorId, AgentCompletionPolicy, AgentDescriptor, AgentRole, AssistantChannel, EventKind,
+    EventTime, Provider, RecordedAgentStatus, SessionEvent, SessionKey, SessionMetadata,
+    SessionOrigin, SpawnProvenance, ToolCategory, ToolFinish, ToolOutcome, ToolStart,
+    UsageObservation,
 };
 
 /// A non-fatal condition that cannot be represented as session activity.
@@ -399,6 +400,7 @@ impl CodexDecoder {
                 id,
                 outcome: tool_outcome(output),
                 completes_spawn: false,
+                spawn_reference: spawn_reference(output),
             }),
         )
         .into_iter()
@@ -458,6 +460,8 @@ impl CodexDecoder {
                         id: ActorId(agent_id),
                         parent,
                         spawn,
+                        spawn_reference: activity.agent_path.clone(),
+                        completion_policy: AgentCompletionPolicy::ExplicitLifecycle,
                         role: AgentRole::Subagent,
                         label,
                         agent_type: None,
@@ -506,6 +510,20 @@ impl CodexDecoder {
             kind,
         })
     }
+}
+
+fn spawn_reference(output: &Value) -> Option<String> {
+    let value = match output {
+        Value::String(text) => serde_json::from_str(text).ok()?,
+        value @ Value::Object(_) => value.clone(),
+        _ => return None,
+    };
+    value
+        .get("task_name")
+        .or_else(|| value.get("path"))
+        .and_then(Value::as_str)
+        .filter(|reference| !reference.is_empty())
+        .map(str::to_owned)
 }
 
 fn mark_item(
@@ -1382,6 +1400,26 @@ mod tests {
             EventKind::AssistantText { text, .. } if text == "Internal review complete."
         )));
         assert!(decoder.finish().is_empty());
+    }
+
+    #[test]
+    fn spawn_output_preserves_only_an_exact_structural_reference() {
+        let (_, events) = decode(concat!(
+            r#"{"type":"session_meta","payload":{"id":"root","cwd":"/workspace","source":"cli"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"spawn","output":"{\"task_name\":\"/root/child\"}"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"ordinary","output":{"message":"/root/not-a-reference"}}}"#,
+            "\n"
+        ));
+        let references: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                EventKind::ToolFinished(finish) => finish.spawn_reference.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(references, ["/root/child"]);
     }
 
     #[test]

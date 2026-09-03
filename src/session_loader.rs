@@ -1,15 +1,16 @@
 //! Native snapshot loading for one provider-neutral session manifest.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::event::{
-    ActorId, AgentDescriptor, AgentRole, EventKind, EventTime, SessionEvent, SessionKey,
-    SpawnProvenance,
+    ActorId, AgentCompletionPolicy, AgentDescriptor, AgentRole, EventKind, EventTime, SessionEvent,
+    SessionKey, SpawnProvenance,
 };
 use crate::formats::claude::{ClaudeDecoder, ClaudeFile, decode_subagent_metadata};
 use crate::formats::codex::CodexDecoder;
+use crate::session_catalog::SyntheticMetadataEvent;
 use crate::session_catalog::{ManifestFile, ManifestFileRole, SessionManifest};
 use crate::state::SessionInfo;
 use crate::tailer::ReplayItem;
@@ -42,13 +43,13 @@ pub struct SessionSnapshot {
     pub items: Vec<ReplayItem>,
     pub info: SessionInfo,
     pub diagnostics: Vec<String>,
-    pub(crate) tracked: HashMap<PathBuf, TrackedFile>,
+    pub(crate) tracked: BTreeMap<PathBuf, TrackedFile>,
     pub(crate) pending_metadata: Vec<PathBuf>,
 }
 
 pub fn load_snapshot(manifest: &SessionManifest) -> SessionSnapshot {
     let mut events = synthetic_events(manifest);
-    let mut tracked = HashMap::new();
+    let mut tracked = BTreeMap::new();
     let mut pending_metadata = Vec::new();
     let mut diagnostics = Vec::new();
     for file in &manifest.files {
@@ -193,29 +194,31 @@ fn snapshot_from_file(
     Ok((bytes, consumed as u64, metadata))
 }
 
-fn synthetic_events(manifest: &SessionManifest) -> Vec<SessionEvent> {
-    manifest
-        .metadata
-        .iter()
-        .map(|metadata| SessionEvent {
-            actor: ActorId(metadata.parent.id.clone()),
-            time: EventTime::AtAgentStart(ActorId(metadata.child.id.clone())),
-            kind: EventKind::AgentDiscovered(AgentDescriptor {
-                id: ActorId(metadata.child.id.clone()),
-                parent: ActorId(metadata.parent.id.clone()),
-                spawn: SpawnProvenance {
-                    tool_call_id: None,
-                    time: EventTime::AtAgentStart(ActorId(metadata.child.id.clone())),
-                    preceding_context: None,
-                },
-                role: AgentRole::Subagent,
-                label: metadata.agent_path.clone(),
-                agent_type: None,
-                description: None,
-                interactive: false,
-            }),
-        })
-        .collect()
+pub(crate) fn synthetic_events(manifest: &SessionManifest) -> Vec<SessionEvent> {
+    manifest.metadata.iter().map(synthetic_event).collect()
+}
+
+pub(crate) fn synthetic_event(metadata: &SyntheticMetadataEvent) -> SessionEvent {
+    SessionEvent {
+        actor: ActorId(metadata.parent.id.clone()),
+        time: EventTime::AtAgentStart(ActorId(metadata.child.id.clone())),
+        kind: EventKind::AgentDiscovered(AgentDescriptor {
+            id: ActorId(metadata.child.id.clone()),
+            parent: ActorId(metadata.parent.id.clone()),
+            spawn: SpawnProvenance {
+                tool_call_id: None,
+                time: EventTime::AtAgentStart(ActorId(metadata.child.id.clone())),
+                preceding_context: None,
+            },
+            spawn_reference: metadata.agent_path.clone(),
+            completion_policy: AgentCompletionPolicy::ExplicitLifecycle,
+            role: AgentRole::Subagent,
+            label: metadata.agent_path.clone(),
+            agent_type: None,
+            description: None,
+            interactive: false,
+        }),
+    }
 }
 
 #[cfg(test)]
