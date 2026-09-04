@@ -13,38 +13,47 @@ may emit several facts, and every fact survives the boundary.
 
 A session is identified by `SessionKey { provider, id }`. Codex identity comes
 from its rollout header, including when a child rollout is opened explicitly.
-Identity evidence may appear in any syntactically accepted provider record, but
-it is trusted only after a positive format discriminator; unrelated records
-cannot claim a session merely by carrying familiar field names. Invalid UTF-8,
-unknown records, and malformed records fail closed or are skipped without
-changing the accepted identity. Parsing remains bounded, defensive, and
-non-fatal.
+Transcript-carried identity may appear in any syntactically accepted provider
+record, but it is trusted as recorded evidence only after a positive format
+discriminator. Familiar fields alone cannot supply Codex identity. Invalid
+UTF-8 and malformed records fail closed or are skipped without changing an
+already accepted identity. Codex identity always needs a positive header;
+narrow Claude filename/empty-file compatibility fallbacks can choose a logical
+view key and emit its session metadata even for an unknown record, but they do
+not trust that record's content or transcript-carried identity. Classification
+is bounded, defensive, and non-fatal.
 
 ## Keep decoder state with each file
 
 Deduplication, copied-prefix suppression, and lifecycle joins depend on history.
 Every tracked file therefore owns its decoder as well as its byte offset and file
-identity. Snapshot-to-tail handoff moves all three together. Replacements and
-truncations re-establish ownership before new bytes are folded.
+identity. Snapshot-to-tail handoff moves all three together. Detectable
+replacements and truncations re-establish ownership before new bytes are folded;
+equal-or-longer same-path replacement relies on Unix device/inode identity and
+cannot be proven on platforms without an equivalent stable identity.
 
 Classification, identity validation, snapshot decoding, and tail handoff must
 observe one opened file handle. A path may be replaced between operations, so a
 probe followed by an independent reopen is not proof that the decoded bytes
-belong to the accepted session. The same strict record framing and UTF-8 policy
-applies on both sides of the handoff.
+belong to the accepted session. The same strict UTF-8 acceptance policy applies
+on both sides of the handoff.
 
 The portable browser feed follows the same rule. Claude directory imports keep a
 decoder for the root, each subagent, and each workflow journal across appends.
 Codex browser support is intentionally a static, single-rollout replay; native
 Codex supports discovery, families, replay, inspect, and live follow.
 
-## Fold facts, not arrival order
+## Fold competing facts by evidence
 
-The derived `SessionModel` must be idempotent and commutative: the final state is
-a function of observed facts, not cross-file arrival order. Stable identities
-join tool calls, results, children, and lifecycle evidence. Timestamp and revision
-ordering decide latest evidence rather than whichever record happened to arrive
-last. Shuffle and live-versus-bulk tests guard this property.
+Reducers for facts that may race across files—usage revisions, lifecycle, and
+spawn provenance—must be idempotent and commutative. Stable identities join tool
+calls, results, children, and lifecycle evidence. Timestamp and revision ordering
+decide latest evidence rather than whichever record happened to arrive last.
+Ordered assistant/reasoning content and first model selection instead follow
+replay order or incoming live delivery order; the live model is updated before
+its timeline batch is sorted, and a later seek may refold that order. These are
+not arbitrary-permutation reducers. Shuffle and live-versus-bulk tests guard the
+specific projections they define.
 
 Derived state is reversible. A late child can reopen a workflow rollup, and a
 later running lifecycle fact can resume an agent. Explicit lifecycle evidence
@@ -56,8 +65,11 @@ that semantic meaning.
 
 Content time comes from session events and determines folding, liveness, tool
 state, and seeks. Presentation time advances while the user watches and governs
-animation, camera motion, and afterglow. A seek rebuilds the model from the event
-prefix and must produce the same state as playback at that point.
+animation, camera motion, and afterglow. A seek makes the model represent the
+timeline prefix: forward seeks fold the additional facts, while backward seeks
+rebuild. Commutative projections match live playback at that point; ordered
+fields are replayed in timeline order and can resolve a cross-source live
+interleaving differently.
 
 Live and replay share one timeline. Replay has a fixed right edge; live grows the
 edge. The playhead paces behind it and pins when it catches up. The scrubber is
@@ -66,24 +78,28 @@ gaps.
 
 ## Discovery is read-only and explicit files stay pinned
 
-The native catalog searches Claude and Codex roots for the requested cwd using
-bounded header reads and deterministic selection. It excludes auxiliary Codex
-rollouts from automatic root selection, closes a chosen root over its known child
-family, and never climbs from an explicitly opened child to an ancestor. A cwd
-watch may switch to a newer eligible root after the quiet gate; a file watch does
-not.
+The native catalog searches Claude and Codex roots for the requested cwd with
+deterministic selection. Claude retains its established canonical-directory and
+filename discovery convention; Codex candidates require bounded positive header
+evidence. The catalog excludes auxiliary Codex rollouts from automatic root
+selection, closes a chosen root over its known child family, and never climbs
+from an explicitly opened child to an ancestor. A cwd watch may switch to a newer
+eligible root after the quiet gate; a file watch does not.
 
-Broad automatic scans inspect only a small bounded prefix so one hostile or huge
-candidate cannot dominate discovery. Once the user pins a file—or a tracked file
-is replaced—the loader streams complete, individually bounded records instead;
-a valid late header remains loadable without turning directory discovery into an
-unbounded read.
+Broad automatic Codex scans inspect only a small bounded prefix so one hostile or
+huge candidate cannot dominate discovery. Once the user pins a file—or a tracked
+file is replaced—a streaming classifier bounds any unfinished probe record, so a
+valid late header remains recognizable without turning Codex directory discovery
+into an unbounded read. After acceptance, snapshot content and newly appended
+regions are currently read in full; the probe bound is not a total-session memory
+bound.
 
-zoetrope never writes transcripts. The runtime adds no HTTP client, and Tokio is
-built without networking. Browser-selected transcript bytes are parsed locally
-and are not uploaded by the app. The hosted website itself still loads ordinary
-site infrastructure such as analytics, so this privacy statement is deliberately
-about transcript handling rather than all page traffic.
+zoetrope never writes transcripts. The native runtime adds no HTTP client, and
+Tokio is built without networking. The browser loader does not intentionally
+upload selected transcript bytes, but the hosted page executes analytics,
+including third-party JavaScript; it is not an offline or sandboxed isolation
+boundary. This privacy statement describes first-party transcript handling, not
+all page code or traffic.
 
 ## Frontend boundary and toolchains
 
