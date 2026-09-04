@@ -13,8 +13,12 @@ may emit several facts, and every fact survives the boundary.
 
 A session is identified by `SessionKey { provider, id }`. Codex identity comes
 from its rollout header, including when a child rollout is opened explicitly.
-Unknown and malformed records are skipped until a positive format discriminator
-is found. Parsing remains bounded, defensive, and non-fatal.
+Identity evidence may appear in any syntactically accepted provider record, but
+it is trusted only after a positive format discriminator; unrelated records
+cannot claim a session merely by carrying familiar field names. Invalid UTF-8,
+unknown records, and malformed records fail closed or are skipped without
+changing the accepted identity. Parsing remains bounded, defensive, and
+non-fatal.
 
 ## Keep decoder state with each file
 
@@ -22,6 +26,12 @@ Deduplication, copied-prefix suppression, and lifecycle joins depend on history.
 Every tracked file therefore owns its decoder as well as its byte offset and file
 identity. Snapshot-to-tail handoff moves all three together. Replacements and
 truncations re-establish ownership before new bytes are folded.
+
+Classification, identity validation, snapshot decoding, and tail handoff must
+observe one opened file handle. A path may be replaced between operations, so a
+probe followed by an independent reopen is not proof that the decoded bytes
+belong to the accepted session. The same strict record framing and UTF-8 policy
+applies on both sides of the handoff.
 
 The portable browser feed follows the same rule. Claude directory imports keep a
 decoder for the root, each subagent, and each workflow journal across appends.
@@ -62,6 +72,12 @@ rollouts from automatic root selection, closes a chosen root over its known chil
 family, and never climbs from an explicitly opened child to an ancestor. A cwd
 watch may switch to a newer eligible root after the quiet gate; a file watch does
 not.
+
+Broad automatic scans inspect only a small bounded prefix so one hostile or huge
+candidate cannot dominate discovery. Once the user pins a file—or a tracked file
+is replaced—the loader streams complete, individually bounded records instead;
+a valid late header remains loadable without turning directory discovery into an
+unbounded read.
 
 zoetrope never writes transcripts. The runtime adds no HTTP client, and Tokio is
 built without networking. Browser-selected transcript bytes are parsed locally
