@@ -387,9 +387,10 @@ impl App {
                 self.current_session = session.clone();
                 self.session = SessionModel::new(session);
                 self.flow = graph::new_flow();
-                // A reset is a fresh live timeline (only live emits resets — the
-                // initial announce, truncation, or auto-switch). Replay arrives
-                // via ReplayLoaded, never a reset.
+                // A reset is a fresh timeline. Feeders announce the identity
+                // they actually decoded before ReplayLoaded, so a file replaced
+                // between foreground selection and background loading cannot be
+                // discarded as stale.
                 self.timeline = Timeline::new();
                 if genuine {
                     self.camera = Camera::Overview;

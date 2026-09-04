@@ -106,10 +106,14 @@ pub enum EventKind {
         text: String,
     },
     AssistantText {
+        /// Stable identity of this semantic fact within its actor stream.
+        fact_id: String,
         channel: AssistantChannel,
         text: String,
     },
     Reasoning {
+        /// Stable identity of this semantic fact within its actor stream.
+        fact_id: String,
         text: String,
     },
     ModelSelected {

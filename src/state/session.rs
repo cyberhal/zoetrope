@@ -7,7 +7,7 @@
 //! group node. Spawn order is tracked explicitly so layout and navigation are
 //! deterministic.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 
@@ -32,6 +32,12 @@ struct LifecycleFact {
 enum SpawnLinkStrength {
     ExactReference,
     StableCallId,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ContentFactKind {
+    Assistant,
+    Reasoning,
 }
 
 /// Silence window after which an interactive sidechain (fork) is shown as
@@ -85,6 +91,9 @@ pub struct SessionModel {
     spawn_references: BTreeMap<(String, String), Vec<String>>,
     child_spawn_references: BTreeMap<String, (String, String)>,
     spawn_link_strength: HashMap<String, SpawnLinkStrength>,
+    /// Content is de-duplicated by adapter-owned semantic identity, never by
+    /// display text: different turns may honestly repeat the same words.
+    seen_content_facts: HashSet<(String, ContentFactKind, String)>,
     /// Every plain user prompt in the main transcript, in order — the
     /// session's spine. Tool calls and spawns attribute to a prompt era via
     /// [`Self::prompt_for_ts`] (timestamp-derived, order-independent).
@@ -363,6 +372,7 @@ impl SessionModel {
             spawn_references: BTreeMap::new(),
             child_spawn_references: BTreeMap::new(),
             spawn_link_strength: HashMap::new(),
+            seen_content_facts: HashSet::new(),
             prompts: Vec::new(),
         }
     }
@@ -449,16 +459,24 @@ impl SessionModel {
                     self.prompts.sort_by_key(|prompt| prompt.ts);
                 }
             }
-            EventKind::AssistantText { text, .. } => {
+            EventKind::AssistantText { fact_id, text, .. } => {
                 if let Some(agent) = self.agents.get_mut(&actor)
-                    && !agent.assistant_text.contains(text)
+                    && self.seen_content_facts.insert((
+                        actor.clone(),
+                        ContentFactKind::Assistant,
+                        fact_id.clone(),
+                    ))
                 {
                     agent.assistant_text.push(text.clone());
                 }
             }
-            EventKind::Reasoning { text } => {
+            EventKind::Reasoning { fact_id, text } => {
                 if let Some(agent) = self.agents.get_mut(&actor)
-                    && !agent.reasoning.contains(text)
+                    && self.seen_content_facts.insert((
+                        actor.clone(),
+                        ContentFactKind::Reasoning,
+                        fact_id.clone(),
+                    ))
                 {
                     agent.reasoning.push(text.clone());
                 }
@@ -1300,6 +1318,53 @@ mod tests {
             })));
         }
         assert_eq!(model.agent(MAIN_ID).unwrap().output_tokens, 25);
+    }
+
+    #[test]
+    fn distinct_codex_turns_keep_identical_text_once_in_every_arrival_order() {
+        let mut decoder = crate::formats::codex::CodexDecoder::new();
+        let lines = [
+            r#"{"type":"session_meta","payload":{"id":"root","source":"cli"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","id":"message-1","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"Done."}]}}"#,
+            r#"{"type":"response_item","payload":{"type":"reasoning","id":"reasoning-1","summary":[{"type":"summary_text","text":"Think."}]}}"#,
+            r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","id":"message-2","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"Done."}]}}"#,
+            r#"{"type":"response_item","payload":{"type":"reasoning","id":"reasoning-2","summary":[{"type":"summary_text","text":"Think."}]}}"#,
+        ];
+        let canonical: Vec<_> = lines
+            .iter()
+            .flat_map(|line| decoder.decode_line(line))
+            .collect();
+        // Simulate the same normalized facts arriving again through a mirrored
+        // provider view: the reducer, not display text, owns final idempotence.
+        let events: Vec<_> = canonical.iter().chain(&canonical).cloned().collect();
+        let session = SessionKey::new(Provider::Codex, "root");
+        let mut forward = SessionModel::new(session.clone());
+        for event in &events {
+            forward.apply_event(event);
+        }
+        let mut reverse = SessionModel::new(session);
+        for event in events.iter().rev() {
+            reverse.apply_event(event);
+        }
+
+        assert_eq!(
+            forward.agent(MAIN_ID).unwrap().assistant_text,
+            ["Done.", "Done."]
+        );
+        assert_eq!(
+            reverse.agent(MAIN_ID).unwrap().assistant_text,
+            ["Done.", "Done."]
+        );
+        assert_eq!(
+            forward.agent(MAIN_ID).unwrap().reasoning,
+            ["Think.", "Think."]
+        );
+        assert_eq!(
+            reverse.agent(MAIN_ID).unwrap().reasoning,
+            ["Think.", "Think."]
+        );
     }
 
     #[test]

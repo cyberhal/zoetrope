@@ -76,7 +76,8 @@ pub enum UiEvent {
         speed: f64,
         info: crate::state::SessionInfo,
     },
-    /// File truncation/rotation detected — the UI should reset its model.
+    /// Adopt the decoder-confirmed identity and reset the model. Sent both for
+    /// truncation/rotation and before a newly loaded snapshot.
     SessionReset { session: SessionKey },
     /// A non-fatal error string for display.
     Error(String),
@@ -113,7 +114,11 @@ pub async fn run(
 
         match next {
             Flow::Switch(target) => current = target,
-            Flow::Reattach => {}
+            Flow::Reattach => {
+                // A replacement may be between records. Avoid spinning while
+                // the same pinned target waits for positive provider evidence.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
             Flow::Exit => return Ok(()),
         }
     }

@@ -26,15 +26,34 @@ pub struct TailState {
     /// the new file is not shorter than the old offset (`None` off unix, or
     /// before the first read).
     identity: Option<(u64, u64)>,
+    /// The buffered EOF tail was a complete JSON record and has already been
+    /// emitted. Keep its bytes until a delimiter arrives so that appending the
+    /// missing newline cannot emit the same record twice.
+    emitted_eof_record: bool,
 }
 
 impl TailState {
-    pub(crate) fn at_snapshot(offset: u64, metadata: Option<&std::fs::Metadata>) -> Self {
-        Self {
+    pub(crate) fn at_snapshot(
+        offset: u64,
+        metadata: Option<&std::fs::Metadata>,
+        bytes: &[u8],
+    ) -> Self {
+        let mut state = Self {
             offset,
             identity: metadata.and_then(file_identity),
             ..Self::default()
+        };
+        if let Some(tail) = unterminated_json_tail(bytes) {
+            if tail.len() <= MAX_PARTIAL {
+                state.partial.extend_from_slice(tail);
+                state.emitted_eof_record = true;
+            } else {
+                // Snapshot decoding has already consumed this valid record;
+                // retain only framing state until its delimiter arrives.
+                state.overflowed = true;
+            }
         }
+        state
     }
 }
 
@@ -74,13 +93,14 @@ pub(crate) fn read_appended(path: &Path, state: &mut TailState) -> ReadResult {
         state.offset = 0;
         state.partial.clear();
         state.overflowed = false;
+        state.emitted_eof_record = false;
         state.identity = identity;
         return ReadResult::Reset;
     }
+    state.identity = identity;
     if len == state.offset {
         return ReadResult::NoChange;
     }
-    state.identity = identity;
 
     if file.seek(SeekFrom::Start(state.offset)).is_err() {
         return ReadResult::Missing;
@@ -94,7 +114,18 @@ pub(crate) fn read_appended(path: &Path, state: &mut TailState) -> ReadResult {
     buf.truncate(n);
     state.offset += n as u64;
 
-    ReadResult::Lines(consume_bytes(state, &buf))
+    let mut lines = consume_bytes(state, &buf);
+    if !state.overflowed
+        && !state.emitted_eof_record
+        && serde_json::from_slice::<serde_json::Value>(&state.partial).is_ok()
+    {
+        if let Some(line) = complete_line(&state.partial) {
+            lines.push(line);
+            state.emitted_eof_record = true;
+        }
+    }
+
+    ReadResult::Lines(lines)
 }
 
 /// Apply newly appended bytes to a [`TailState`], returning the parsed entries
@@ -107,6 +138,12 @@ pub(crate) fn consume_bytes(state: &mut TailState, appended: &[u8]) -> Vec<Strin
 
     for (i, &byte) in appended.iter().enumerate() {
         if byte == b'\n' {
+            if state.emitted_eof_record {
+                state.partial.clear();
+                state.emitted_eof_record = false;
+                start = i + 1;
+                continue;
+            }
             if state.overflowed {
                 // End of the oversized line we were skipping — resync here.
                 state.overflowed = false;
@@ -131,6 +168,18 @@ pub(crate) fn consume_bytes(state: &mut TailState, appended: &[u8]) -> Vec<Strin
         }
     }
 
+    if state.emitted_eof_record
+        && start < appended.len()
+        && appended[start..]
+            .iter()
+            .any(|byte| !byte.is_ascii_whitespace())
+    {
+        // A complete JSON record at EOF must be followed by a delimiter. If
+        // the writer instead continues the same physical line, retain the
+        // bytes as an invalid/incomplete line until it is terminated.
+        state.emitted_eof_record = false;
+    }
+
     // Buffer the trailing partial (no terminating newline yet) — unless we're
     // skipping a runaway line, or it would blow past the cap (drop + resync).
     if !state.overflowed && start < appended.len() {
@@ -138,10 +187,21 @@ pub(crate) fn consume_bytes(state: &mut TailState, appended: &[u8]) -> Vec<Strin
         if state.partial.len() > MAX_PARTIAL {
             state.partial.clear();
             state.overflowed = true;
+            state.emitted_eof_record = false;
         }
     }
 
     lines
+}
+
+fn unterminated_json_tail(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.is_empty() || bytes.ends_with(b"\n") {
+        return None;
+    }
+    let tail = bytes.rsplit(|byte| *byte == b'\n').next()?;
+    serde_json::from_slice::<serde_json::Value>(tail)
+        .is_ok()
+        .then_some(tail)
 }
 
 /// `(dev, ino)` for rotation detection; `None` on platforms without inodes.
@@ -231,6 +291,22 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_does_not_copy_an_oversized_unterminated_json_record() {
+        let mut record = Vec::with_capacity(MAX_PARTIAL + 2);
+        record.push(b'"');
+        record.extend(std::iter::repeat_n(b'x', MAX_PARTIAL));
+        record.push(b'"');
+        let mut state = TailState::at_snapshot(record.len() as u64, None, &record);
+
+        assert!(state.partial.is_empty());
+        assert!(state.overflowed);
+        assert_eq!(
+            consume_bytes(&mut state, b"\n{\"type\":\"user\"}\n"),
+            [r#"{"type":"user"}"#]
+        );
+    }
+
+    #[test]
     fn consume_skips_malformed_lines() {
         let mut state = TailState::default();
         // Framing does not interpret provider content.
@@ -288,6 +364,64 @@ mod tests {
         ));
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn read_appended_emits_a_complete_json_record_at_eof_only_once() {
+        use std::io::Write;
+
+        let tmp =
+            std::env::temp_dir().join(format!("zoetrope_tail_eof_{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::write(&tmp, br#"{"type":"event_msg"}"#).unwrap();
+        let mut state = TailState::default();
+
+        assert!(matches!(
+            read_appended(&tmp, &mut state),
+            ReadResult::Lines(lines) if lines == [r#"{"type":"event_msg"}"#]
+        ));
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&tmp)
+            .unwrap()
+            .write_all(b"\n")
+            .unwrap();
+        assert!(matches!(
+            read_appended(&tmp, &mut state),
+            ReadResult::Lines(lines) if lines.is_empty()
+        ));
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    #[test]
+    fn eof_record_stays_emitted_across_segmented_crlf_and_spaces() {
+        use std::io::Write;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "zoetrope_tail_segmented_crlf_{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::write(&tmp, br#"{"type":"event_msg"}"#).unwrap();
+        let mut state = TailState::default();
+
+        assert!(matches!(
+            read_appended(&tmp, &mut state),
+            ReadResult::Lines(lines) if lines == [r#"{"type":"event_msg"}"#]
+        ));
+        for suffix in [b" ".as_slice(), b"\r", b"\n"] {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&tmp)
+                .unwrap()
+                .write_all(suffix)
+                .unwrap();
+            assert!(matches!(
+                read_appended(&tmp, &mut state),
+                ReadResult::Lines(lines) if lines.is_empty()
+            ));
+        }
+        let _ = std::fs::remove_file(tmp);
     }
 
     #[test]
@@ -394,7 +528,8 @@ mod tests {
             .write_all(b"old-line\n")
             .unwrap();
         let metadata = std::fs::metadata(&watched).unwrap();
-        let mut state = TailState::at_snapshot(metadata.len(), Some(&metadata));
+        let bytes = std::fs::read(&watched).unwrap();
+        let mut state = TailState::at_snapshot(metadata.len(), Some(&metadata), &bytes);
 
         std::fs::File::create(&incoming)
             .unwrap()

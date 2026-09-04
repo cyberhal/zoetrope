@@ -150,7 +150,7 @@ impl CodexDecoder {
         timestamp: Option<DateTime<Utc>>,
         payload: TurnContextPayload,
     ) -> Vec<SessionEvent> {
-        if let Some(turn_id) = payload.turn_id.filter(|id| !id.is_empty()) {
+        if let Some(turn_id) = payload.turn_id.filter(|id| !id.trim().is_empty()) {
             self.current_turn = Some(turn_id);
         }
         let Some(model) = payload.model.filter(|model| !model.trim().is_empty()) else {
@@ -181,16 +181,17 @@ impl CodexDecoder {
                 content,
             } if role.as_deref() == Some("assistant") => {
                 let text = visible_text(&content, "output_text");
-                if text.is_empty()
-                    || !mark_item(
-                        &mut self.seen_assistant_items,
-                        self.current_turn.as_deref(),
-                        id,
-                        &text,
-                    )
-                {
+                if text.is_empty() {
                     return Vec::new();
                 }
+                let Some(fact_id) = mark_item(
+                    &mut self.seen_assistant_items,
+                    self.current_turn.as_deref(),
+                    id,
+                    &text,
+                ) else {
+                    return Vec::new();
+                };
                 let channel = match phase.as_deref() {
                     Some("commentary") => AssistantChannel::Commentary,
                     Some("final" | "final_answer") => AssistantChannel::Final,
@@ -198,9 +199,16 @@ impl CodexDecoder {
                     None => AssistantChannel::Other("assistant".to_owned()),
                 };
                 self.latest_context_text = Some(text.clone());
-                self.event(timestamp, EventKind::AssistantText { channel, text })
-                    .into_iter()
-                    .collect()
+                self.event(
+                    timestamp,
+                    EventKind::AssistantText {
+                        fact_id,
+                        channel,
+                        text,
+                    },
+                )
+                .into_iter()
+                .collect()
             }
             ResponseItem::Message {
                 id, role, content, ..
@@ -213,18 +221,19 @@ impl CodexDecoder {
             }
             ResponseItem::Reasoning { id, summary, .. } => {
                 let text = visible_text(&summary, "summary_text");
-                if text.is_empty()
-                    || !mark_item(
-                        &mut self.seen_reasoning_items,
-                        self.current_turn.as_deref(),
-                        id,
-                        &text,
-                    )
-                {
+                if text.is_empty() {
                     return Vec::new();
                 }
+                let Some(fact_id) = mark_item(
+                    &mut self.seen_reasoning_items,
+                    self.current_turn.as_deref(),
+                    id,
+                    &text,
+                ) else {
+                    return Vec::new();
+                };
                 self.latest_context_text = Some(text.clone());
-                self.event(timestamp, EventKind::Reasoning { text })
+                self.event(timestamp, EventKind::Reasoning { fact_id, text })
                     .into_iter()
                     .collect()
             }
@@ -257,7 +266,7 @@ impl CodexDecoder {
     ) -> Vec<SessionEvent> {
         match payload {
             EventMessage::TaskStarted { turn_id } => {
-                self.current_turn = turn_id.filter(|id| !id.is_empty());
+                self.current_turn = turn_id.filter(|id| !id.trim().is_empty());
                 self.latest_context_text = None;
                 Vec::new()
             }
@@ -338,7 +347,7 @@ impl CodexDecoder {
         input: Option<&str>,
     ) -> Vec<SessionEvent> {
         let (Some(id), Some(name)) = (
-            call_id.filter(|id| !id.is_empty()),
+            call_id.filter(|id| !id.trim().is_empty()),
             name.filter(|name| !name.is_empty()),
         ) else {
             return Vec::new();
@@ -388,7 +397,7 @@ impl CodexDecoder {
         call_id: Option<String>,
         output: &Value,
     ) -> Vec<SessionEvent> {
-        let Some(id) = call_id.filter(|id| !id.is_empty()) else {
+        let Some(id) = call_id.filter(|id| !id.trim().is_empty()) else {
             return Vec::new();
         };
         if !self.seen_call_finishes.insert(id.clone()) {
@@ -413,7 +422,7 @@ impl CodexDecoder {
         activity: SubAgentActivity,
     ) -> Vec<SessionEvent> {
         let (Some(agent_id), Some(kind)) = (
-            activity.agent_thread_id.filter(|id| !id.is_empty()),
+            activity.agent_thread_id.filter(|id| !id.trim().is_empty()),
             activity.kind,
         ) else {
             return Vec::new();
@@ -422,7 +431,11 @@ impl CodexDecoder {
             .occurred_at_ms
             .and_then(DateTime::<Utc>::from_timestamp_millis)
             .or(fallback_timestamp);
-        let duplicate = match activity.event_id.as_ref().filter(|id| !id.is_empty()) {
+        let duplicate = match activity
+            .event_id
+            .as_ref()
+            .filter(|id| !id.trim().is_empty())
+        {
             Some(event_id) => !self.seen_agent_activity_ids.insert(event_id.clone()),
             None => !self.seen_unidentified_activity.insert((
                 agent_id.clone(),
@@ -531,11 +544,11 @@ fn mark_item(
     current_turn: Option<&str>,
     id: Option<String>,
     fallback: &str,
-) -> bool {
-    seen.insert(
-        id.filter(|id| !id.is_empty())
-            .unwrap_or_else(|| format!("{}:{fallback}", current_turn.unwrap_or("unknown-turn"))),
-    )
+) -> Option<String> {
+    let fact_id = id
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| format!("{}:{fallback}", current_turn.unwrap_or("unknown-turn")));
+    seen.insert(fact_id.clone()).then_some(fact_id)
 }
 
 fn event_time(timestamp: Option<DateTime<Utc>>) -> EventTime {
@@ -974,10 +987,10 @@ mod tests {
                 }
                 EventKind::Activity => "activity".to_owned(),
                 EventKind::Prompt { text } => format!("prompt {text}"),
-                EventKind::AssistantText { channel, text } => {
+                EventKind::AssistantText { channel, text, .. } => {
                     format!("assistant {channel:?} {text}")
                 }
-                EventKind::Reasoning { text } => format!("reasoning {text}"),
+                EventKind::Reasoning { text, .. } => format!("reasoning {text}"),
                 EventKind::ModelSelected { model } => format!("model {model}"),
                 EventKind::UsageObserved(usage) => {
                     format!("usage {} output={:?}", usage.scope, usage.output_tokens)
@@ -1024,7 +1037,7 @@ mod tests {
         let assistant: Vec<(&AssistantChannel, &str)> = events
             .iter()
             .filter_map(|event| match &event.kind {
-                EventKind::AssistantText { channel, text } => Some((channel, text.as_str())),
+                EventKind::AssistantText { channel, text, .. } => Some((channel, text.as_str())),
                 _ => None,
             })
             .collect();
@@ -1036,7 +1049,7 @@ mod tests {
         let reasoning: Vec<&str> = events
             .iter()
             .filter_map(|event| match &event.kind {
-                EventKind::Reasoning { text } => Some(text.as_str()),
+                EventKind::Reasoning { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect();
@@ -1355,6 +1368,7 @@ mod tests {
             EventKind::AssistantText {
                 channel: AssistantChannel::Final,
                 text,
+                ..
             } if text == "The checklist is complete."
         )));
         assert!(decoder.finish().is_empty());

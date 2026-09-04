@@ -706,6 +706,7 @@ mod tests {
                     actor: child.clone(),
                     time: EventTime::At(timestamp),
                     kind: EventKind::Reasoning {
+                        fact_id: "child-reasoning".into(),
                         text: "work".into(),
                     },
                 },

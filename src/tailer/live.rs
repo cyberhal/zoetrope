@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use super::bytes::{ReadResult, TailState, read_appended};
+use super::bytes::{ReadResult, read_appended};
 use super::{Flow, TailRequest, UiEvent};
 use crate::event::{SessionEvent, SessionKey};
 use crate::session_catalog::{
@@ -16,7 +16,7 @@ use crate::session_catalog::{
 };
 #[cfg(test)]
 use crate::session_loader::manifest_for_file;
-use crate::session_loader::{TrackedFile, decoder_for, load_snapshot, synthetic_event};
+use crate::session_loader::{TrackedFile, load_manifest_file, load_snapshot, synthetic_event};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const CATALOG_REFRESH_EVERY: u32 = 10;
@@ -40,12 +40,10 @@ impl LiveSession {
         catalog: SessionCatalog,
         mut manifest: SessionManifest,
         tracked: BTreeMap<PathBuf, TrackedFile>,
-        pending_metadata: Vec<PathBuf>,
+        pending_files: Vec<PathBuf>,
         replay_speed: f64,
     ) -> Self {
-        manifest
-            .files
-            .retain(|file| !pending_metadata.contains(&file.path));
+        retain_validated_files_and_metadata(&mut manifest, &pending_files);
         let seen_synthetic_metadata = manifest
             .metadata
             .iter()
@@ -63,6 +61,20 @@ impl LiveSession {
             pending_resets: BTreeSet::new(),
         }
     }
+}
+
+fn retain_validated_files_and_metadata(manifest: &mut SessionManifest, pending_files: &[PathBuf]) {
+    manifest
+        .files
+        .retain(|file| !pending_files.contains(&file.path));
+    let accepted: BTreeSet<_> = manifest
+        .files
+        .iter()
+        .filter_map(|file| file.session.clone())
+        .collect();
+    manifest
+        .metadata
+        .retain(|metadata| accepted.contains(&metadata.child));
 }
 
 pub(crate) async fn run_live(
@@ -87,7 +99,13 @@ pub(crate) async fn run_live(
             .await;
         return Flow::Exit;
     }
-    let snapshot = load_snapshot(&manifest);
+    let snapshot = match load_snapshot(&manifest) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let _ = ui_tx.send(UiEvent::Error(error.to_string())).await;
+            return Flow::Reattach;
+        }
+    };
     let session = snapshot.key.clone();
     let _ = ui_tx
         .send(UiEvent::SessionReset {
@@ -114,7 +132,7 @@ pub(crate) async fn run_live(
         catalog,
         manifest,
         snapshot.tracked,
-        snapshot.pending_metadata,
+        snapshot.pending_files,
         1.0,
     );
     tail_loop(live, ui_tx, req_rx).await
@@ -237,12 +255,6 @@ fn refresh_manifest(live: &mut LiveSession, events: &mut Vec<SessionEvent>, refr
         live.catalog.refresh();
     }
     let current = live.catalog.manifest_for_root(&live.manifest.root);
-    for metadata in &current.metadata {
-        let key = (metadata.parent.clone(), metadata.child.clone());
-        if live.seen_synthetic_metadata.insert(key) {
-            events.push(synthetic_event(metadata));
-        }
-    }
     for file in &current.files {
         if live
             .manifest
@@ -252,39 +264,70 @@ fn refresh_manifest(live: &mut LiveSession, events: &mut Vec<SessionEvent>, refr
         {
             continue;
         }
-        match &file.role {
-            ManifestFileRole::ClaudeSubagentMetadata { agent_id, workflow } => {
-                if let Ok(text) = std::fs::read_to_string(&file.path) {
-                    let decoded = crate::formats::claude::decode_subagent_metadata(
-                        &live.manifest.root.key,
-                        agent_id,
-                        workflow.as_deref(),
-                        &text,
-                    );
-                    if decoded.is_empty() {
-                        continue;
-                    }
-                    events.extend(decoded);
-                }
-            }
-            _ => {
-                if let Some(decoder) = decoder_for(&current, file) {
-                    live.tracked.insert(
-                        file.path.clone(),
-                        TrackedFile {
-                            tail: TailState::default(),
-                            decoder,
-                        },
-                    );
-                }
-            }
+        if attach_manifest_file(live, &current, file, events) {
+            live.manifest.files.push(file.clone());
         }
-        live.manifest.files.push(file.clone());
     }
     live.manifest
         .files
         .sort_by(|left, right| left.path.cmp(&right.path));
-    live.manifest.metadata = current.metadata;
+    let accepted: BTreeSet<_> = live
+        .manifest
+        .files
+        .iter()
+        .filter_map(|file| file.session.clone())
+        .collect();
+    live.manifest.metadata = current
+        .metadata
+        .into_iter()
+        .filter(|metadata| accepted.contains(&metadata.child))
+        .collect();
+    for metadata in &live.manifest.metadata {
+        let key = (metadata.parent.clone(), metadata.child.clone());
+        if live.seen_synthetic_metadata.insert(key) {
+            events.push(synthetic_event(metadata));
+        }
+    }
+}
+
+fn attach_manifest_file(
+    live: &mut LiveSession,
+    current: &SessionManifest,
+    file: &crate::session_catalog::ManifestFile,
+    events: &mut Vec<SessionEvent>,
+) -> bool {
+    match &file.role {
+        ManifestFileRole::ClaudeSubagentMetadata { agent_id, workflow } => {
+            if let Ok(text) = std::fs::read_to_string(&file.path) {
+                let decoded = crate::formats::claude::decode_subagent_metadata(
+                    &live.manifest.root.key,
+                    agent_id,
+                    workflow.as_deref(),
+                    &text,
+                );
+                if decoded.is_empty() {
+                    false
+                } else {
+                    events.extend(decoded);
+                    true
+                }
+            } else {
+                false
+            }
+        }
+        _ => match load_manifest_file(current, file) {
+            Ok(Some(loaded)) => {
+                events.extend(loaded.events);
+                live.tracked.insert(file.path.clone(), loaded.tracked);
+                true
+            }
+            Ok(None) => false,
+            // A newly discovered path has never contributed facts or decoder
+            // state, so conflicting identity is simply not attached. Tracked
+            // file replacement is the separate path that requests a reload.
+            Err(_) => false,
+        },
+    }
 }
 
 async fn reload_current(live: &mut LiveSession, ui_tx: &mpsc::Sender<UiEvent>) -> bool {
@@ -296,7 +339,10 @@ async fn reload_current(live: &mut LiveSession, ui_tx: &mpsc::Sender<UiEvent>) -
         return false;
     }
     let current_path = live.manifest.root.path.clone();
-    let Some(mut manifest) = live.catalog.replacement_manifest(&current_path) else {
+    let Some(mut manifest) = live
+        .catalog
+        .replacement_manifest_with_overlays(&current_path, &live.pending_resets)
+    else {
         return false;
     };
     if manifest.root.key == live.manifest.root.key {
@@ -309,16 +355,20 @@ async fn reload_current(live: &mut LiveSession, ui_tx: &mpsc::Sender<UiEvent>) -
             }
         }
     }
-    let snapshot = load_snapshot(&manifest);
+    let snapshot = match load_snapshot(&manifest) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let _ = ui_tx.send(UiEvent::Error(error.to_string())).await;
+            return false;
+        }
+    };
     let session = snapshot.key.clone();
+    retain_validated_files_and_metadata(&mut manifest, &snapshot.pending_files);
     live.seen_synthetic_metadata = manifest
         .metadata
         .iter()
         .map(|metadata| (metadata.parent.clone(), metadata.child.clone()))
         .collect();
-    manifest
-        .files
-        .retain(|file| !snapshot.pending_metadata.contains(&file.path));
     live.manifest = manifest;
     live.tracked = snapshot.tracked;
     live.ticks = 0;
@@ -364,13 +414,13 @@ mod tests {
         let mut catalog = SessionCatalog::new(roots);
         let target = WatchTarget::File(path.to_owned());
         let manifest = catalog.manifest(&target).unwrap();
-        let snapshot = load_snapshot(&manifest);
+        let snapshot = load_snapshot(&manifest).unwrap();
         LiveSession::from_snapshot(
             target,
             catalog,
             manifest,
             snapshot.tracked,
-            snapshot.pending_metadata,
+            snapshot.pending_files,
             1.0,
         )
     }
@@ -416,6 +466,37 @@ mod tests {
                 "uuid": "prompt",
                 "timestamp": "2026-09-04T10:00:00Z",
                 "message": { "role": "user", "content": text }
+            })
+        )
+    }
+
+    fn claude_child_prompt(session: &str, agent: &str, text: &str) -> String {
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "user",
+                "uuid": format!("{agent}-{text}"),
+                "timestamp": "2026-09-04T10:00:00Z",
+                "sessionId": session,
+                "agentId": agent,
+                "message": { "role": "user", "content": text }
+            })
+        )
+    }
+
+    fn claude_child_output(session: &str, agent: &str, text: &str) -> String {
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "assistant",
+                "uuid": format!("{agent}-{text}"),
+                "timestamp": "2026-09-04T10:00:01Z",
+                "sessionId": session,
+                "agentId": agent,
+                "message": {
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": text }]
+                }
             })
         )
     }
@@ -647,6 +728,295 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn late_child_snapshot_emits_a_valid_final_record_without_newline_once() {
+        let (base, roots) = roots("late_child_eof");
+        let root = codex_file(&base, "root-late-eof");
+        std::fs::write(
+            &root,
+            root_header("root-late-eof", Path::new("/workspace/demo")),
+        )
+        .unwrap();
+        let mut live = live_from_file(&root, roots);
+        let child = codex_file(&base, "child-late-eof");
+        let text = child_text(
+            "child-late-eof",
+            "root-late-eof",
+            "/root/child",
+            "final without newline",
+        );
+        std::fs::write(&child, text.trim_end_matches('\n')).unwrap();
+
+        live.ticks = CATALOG_REFRESH_EVERY - 1;
+        let events = poll_batch(&mut live).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    EventKind::AssistantText { text, .. } if text == "final without newline"
+                ))
+                .count(),
+            1
+        );
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&child)
+            .unwrap()
+            .write_all(b"\n")
+            .unwrap();
+        assert!(poll_batch(&mut live).await.is_empty());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn late_child_keeps_a_truncated_final_record_until_it_becomes_valid() {
+        let (base, roots) = roots("late_child_partial");
+        let root = codex_file(&base, "root-late-partial");
+        std::fs::write(
+            &root,
+            root_header("root-late-partial", Path::new("/workspace/demo")),
+        )
+        .unwrap();
+        let mut live = live_from_file(&root, roots);
+        let child = codex_file(&base, "child-late-partial");
+        let full = child_text(
+            "child-late-partial",
+            "root-late-partial",
+            "/root/child",
+            "completed later",
+        );
+        let final_start = full.rfind('\n').unwrap_or(full.len());
+        let final_start = full[..final_start].rfind('\n').map_or(0, |index| index + 1);
+        let split = final_start + (full.len() - final_start) / 2;
+        std::fs::write(&child, &full.as_bytes()[..split]).unwrap();
+
+        live.ticks = CATALOG_REFRESH_EVERY - 1;
+        let initial = poll_batch(&mut live).await;
+        assert!(!initial.iter().any(|event| matches!(
+            &event.kind,
+            EventKind::AssistantText { text, .. } if text == "completed later"
+        )));
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&child)
+            .unwrap()
+            .write_all(&full.as_bytes()[split..])
+            .unwrap();
+        let completed = poll_batch(&mut live).await;
+        assert_eq!(
+            completed
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    EventKind::AssistantText { text, .. } if text == "completed later"
+                ))
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn tracked_root_append_emits_a_valid_eof_record_without_waiting_for_newline() {
+        let (base, roots) = roots("tracked_root_eof");
+        let root = codex_file(&base, "root-tracked-eof");
+        std::fs::write(
+            &root,
+            root_header("root-tracked-eof", Path::new("/workspace/demo")),
+        )
+        .unwrap();
+        let mut live = live_from_file(&root, roots);
+        let assistant = r#"{"timestamp":"2026-09-04T10:00:03Z","type":"response_item","payload":{"type":"message","id":"root-eof-message","role":"assistant","content":[{"type":"output_text","text":"root eof"}]}}"#;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&root)
+            .unwrap()
+            .write_all(assistant.as_bytes())
+            .unwrap();
+        let events = poll_batch(&mut live).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    EventKind::AssistantText { text, .. } if text == "root eof"
+                ))
+                .count(),
+            1
+        );
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&root)
+            .unwrap()
+            .write_all(b"\n")
+            .unwrap();
+        assert!(poll_batch(&mut live).await.is_empty());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn late_child_replacement_between_catalog_and_open_never_leaks() {
+        let (base, roots) = roots("late_child_replacement_window");
+        let root = codex_file(&base, "root-late-race");
+        std::fs::write(
+            &root,
+            root_header("root-late-race", Path::new("/workspace/demo")),
+        )
+        .unwrap();
+        let mut live = live_from_file(&root, roots);
+        let child = codex_file(&base, "child-late-race");
+        std::fs::write(
+            &child,
+            child_text(
+                "child-late-race",
+                "root-late-race",
+                "/root/child",
+                "family A",
+            ),
+        )
+        .unwrap();
+        live.catalog.refresh();
+
+        std::fs::write(
+            &child,
+            child_text(
+                "child-late-race",
+                "unrelated-root",
+                "/other/child",
+                "must not leak",
+            ),
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        refresh_manifest(&mut live, &mut events, false);
+        let child = child.canonicalize().unwrap();
+        assert!(events.is_empty());
+        assert!(!live.tracked.contains_key(&child));
+        assert!(!live.manifest.files.iter().any(|file| file.path == child));
+        assert!(!live.pending_resets.contains(&child));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn partial_foreign_child_never_binds_and_can_later_attach_as_claude() {
+        let (base, roots) = roots("claude_partial_foreign_child");
+        let session = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let root = base.join(format!("{session}.jsonl"));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(&root, claude_child_prompt(session, "root", "root")).unwrap();
+        let mut live = live_from_file(&root, roots);
+        let subagents = base.join(session).join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        let child = subagents.join("agent-child-a.jsonl");
+        let codex = root_header("foreign-codex", Path::new("/workspace/foreign"));
+        let split = codex.len() / 2;
+        std::fs::write(&child, &codex.as_bytes()[..split]).unwrap();
+
+        live.ticks = CATALOG_REFRESH_EVERY - 1;
+        assert!(poll_batch(&mut live).await.is_empty());
+        let child = child.canonicalize().unwrap();
+        assert!(!live.tracked.contains_key(&child));
+        assert!(!live.manifest.files.iter().any(|file| file.path == child));
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&child)
+            .unwrap()
+            .write_all(&codex.as_bytes()[split..])
+            .unwrap();
+        live.ticks = CATALOG_REFRESH_EVERY - 1;
+        let events = poll_batch(&mut live).await;
+        assert!(
+            events.is_empty(),
+            "completed foreign Codex facts do not leak"
+        );
+        assert!(!live.tracked.contains_key(&child));
+        assert!(live.pending_resets.is_empty());
+
+        std::fs::write(
+            &child,
+            claude_child_output(session, "child-a", "valid child"),
+        )
+        .unwrap();
+        live.ticks = CATALOG_REFRESH_EVERY - 1;
+        let events = poll_batch(&mut live).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    EventKind::AssistantText { text, .. } if text == "valid child"
+                ))
+                .count(),
+            1
+        );
+        assert!(live.tracked.contains_key(&child));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn pending_child_discovery_is_emitted_once_after_validated_attach() {
+        let (base, roots) = roots("pending_child_discovery");
+        let root = codex_file(&base, "root-pending-child");
+        let child = codex_file(&base, "child-pending");
+        std::fs::write(
+            &root,
+            root_header("root-pending-child", Path::new("/workspace/demo")),
+        )
+        .unwrap();
+        let complete = child_text(
+            "child-pending",
+            "root-pending-child",
+            "/root/child",
+            "owned after attach",
+        );
+        std::fs::write(&child, &complete).unwrap();
+        let target = WatchTarget::File(root.clone());
+        let mut catalog = SessionCatalog::new(roots);
+        let manifest = catalog.manifest(&target).unwrap();
+        let split = complete.find('\n').unwrap() / 2;
+        std::fs::write(&child, &complete.as_bytes()[..split]).unwrap();
+        let snapshot = load_snapshot(&manifest).unwrap();
+        assert_eq!(snapshot.pending_files, [child.canonicalize().unwrap()]);
+        assert!(!snapshot.items.iter().any(|item| matches!(
+            &item.event.kind,
+            EventKind::AgentDiscovered(agent) if agent.id.0 == "child-pending"
+        )));
+        let mut live = LiveSession::from_snapshot(
+            target,
+            catalog,
+            manifest,
+            snapshot.tracked,
+            snapshot.pending_files,
+            1.0,
+        );
+        assert!(live.seen_synthetic_metadata.is_empty());
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&child)
+            .unwrap()
+            .write_all(&complete.as_bytes()[split..])
+            .unwrap();
+        live.ticks = CATALOG_REFRESH_EVERY - 1;
+        let events = poll_batch(&mut live).await;
+        let discoveries: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                EventKind::AgentDiscovered(agent) if agent.id.0 == "child-pending" => Some(agent),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(discoveries.len(), 1);
+        assert_eq!(discoveries[0].parent.0, "root-pending-child");
+
+        live.ticks = CATALOG_REFRESH_EVERY - 1;
+        assert!(poll_batch(&mut live).await.is_empty());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
     async fn catalog_refresh_is_throttled_between_poll_ticks() {
         let (base, roots) = roots("refresh_throttle");
         let root = codex_file(&base, "root-throttle");
@@ -707,13 +1077,13 @@ mod tests {
         let manifest = catalog
             .manifest(&WatchTarget::File(claude.clone()))
             .unwrap();
-        let snapshot = load_snapshot(&manifest);
+        let snapshot = load_snapshot(&manifest).unwrap();
         let mut live = LiveSession::from_snapshot(
             WatchTarget::LatestForCwd(cwd.clone()),
             catalog,
             manifest,
             snapshot.tracked,
-            snapshot.pending_metadata,
+            snapshot.pending_files,
             1.0,
         );
         let codex = codex_file(&base, "new-codex-root");
@@ -742,13 +1112,13 @@ mod tests {
         let manifest = catalog
             .manifest(&WatchTarget::File(claude.clone()))
             .unwrap();
-        let snapshot = load_snapshot(&manifest);
+        let snapshot = load_snapshot(&manifest).unwrap();
         let mut live = LiveSession::from_snapshot(
             WatchTarget::LatestForCwd(cwd.clone()),
             catalog,
             manifest,
             snapshot.tracked,
-            snapshot.pending_metadata,
+            snapshot.pending_files,
             1.0,
         );
         let codex = codex_file(&base, "unscanned-root");
@@ -900,7 +1270,7 @@ mod tests {
         let mut catalog = SessionCatalog::new(roots.clone());
         let target = WatchTarget::File(root.clone());
         let manifest = catalog.manifest(&target).unwrap();
-        let snapshot = load_snapshot(&manifest);
+        let snapshot = load_snapshot(&manifest).unwrap();
         let mut live_model = SessionModel::new(snapshot.key.clone());
         for item in &snapshot.items {
             live_model.apply_event(&item.event);
@@ -910,7 +1280,7 @@ mod tests {
             catalog,
             manifest,
             snapshot.tracked,
-            snapshot.pending_metadata,
+            snapshot.pending_files,
             1.0,
         );
         let child = codex_file(&base, "child-converge");
@@ -931,7 +1301,7 @@ mod tests {
 
         let mut fresh_catalog = SessionCatalog::new(roots);
         let fresh_manifest = fresh_catalog.manifest(&WatchTarget::File(root)).unwrap();
-        let fresh = load_snapshot(&fresh_manifest);
+        let fresh = load_snapshot(&fresh_manifest).unwrap();
         let mut fresh_model = SessionModel::new(fresh.key);
         for item in &fresh.items {
             fresh_model.apply_event(&item.event);
@@ -1037,6 +1407,126 @@ mod tests {
         assert!(items.iter().any(|item| item.event.actor.0 == "new-child"));
         assert!(!items.iter().any(|item| item.event.actor.0 == "old-child"));
         assert!(rx.try_recv().is_err());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn tracked_child_replacement_keeps_a_large_header_in_the_family() {
+        let (base, roots) = roots("tracked_child_large_header");
+        let root = codex_file(&base, "root-large-child");
+        let child = codex_file(&base, "child-before-large");
+        std::fs::write(
+            &root,
+            root_header("root-large-child", Path::new("/workspace/demo")),
+        )
+        .unwrap();
+        std::fs::write(
+            &child,
+            child_text(
+                "child-before-large",
+                "root-large-child",
+                "/root/old",
+                "old child",
+            ),
+        )
+        .unwrap();
+        let mut live = live_from_file(&root, roots);
+
+        let header = serde_json::json!({
+            "timestamp": "2026-09-04T10:00:01Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "child-after-large",
+                "cwd": "/workspace/demo",
+                "source": {
+                    "subagent": {
+                        "thread_spawn": {
+                            "parent_thread_id": "root-large-child",
+                            "agent_path": "/root/new",
+                        }
+                    }
+                },
+                "padding": "x".repeat(crate::session_catalog::DEFAULT_HEADER_BYTES + 4096),
+            }
+        });
+        let replacement = [
+            header.to_string(),
+            r#"{"type":"inter_agent_communication_metadata","payload":{"trigger_turn":true}}"#
+                .to_owned(),
+            r#"{"timestamp":"2026-09-04T10:00:03Z","type":"response_item","payload":{"type":"message","id":"large-owned","role":"assistant","content":[{"type":"output_text","text":"large replacement"}]}}"#
+                .to_owned(),
+            String::new(),
+        ]
+        .join("\n");
+        let incoming = child.with_extension("incoming");
+        std::fs::write(&incoming, replacement).unwrap();
+        std::fs::rename(incoming, &child).unwrap();
+
+        let (tx, mut rx) = mpsc::channel(8);
+        assert!(!poll_live(&mut live, &tx).await);
+        assert!(matches!(rx.try_recv(), Ok(UiEvent::SessionReset { .. })));
+        let items = match rx.try_recv().unwrap() {
+            UiEvent::ReplayLoaded { items, .. } => items,
+            other => panic!("expected replacement replay, got {other:?}"),
+        };
+        assert!(items.iter().any(|item| {
+            item.event.actor.0 == "child-after-large"
+                && matches!(
+                    &item.event.kind,
+                    EventKind::AssistantText { text, .. } if text == "large replacement"
+                )
+        }));
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.event.actor.0 == "child-before-large")
+        );
+        assert!(live.manifest.files.iter().any(|file| {
+            file.session.as_ref() == Some(&SessionKey::new(Provider::Codex, "child-after-large"))
+        }));
+        assert!(live.tracked.contains_key(&child.canonicalize().unwrap()));
+        assert!(rx.try_recv().is_err());
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&child)
+            .unwrap()
+            .write_all(concat!(
+                r#"{"timestamp":"2026-09-04T10:00:04Z","type":"response_item","payload":{"type":"message","id":"large-append","role":"assistant","content":[{"type":"output_text","text":"append after large header"}]}}"#,
+                "\n"
+            ).as_bytes())
+            .unwrap();
+        live.ticks = CATALOG_REFRESH_EVERY - 1;
+        let appended = poll_batch(&mut live).await;
+        assert!(appended.iter().any(|event| matches!(
+            &event.kind,
+            EventKind::AssistantText { text, .. } if text == "append after large header"
+        )));
+        assert!(live.manifest.files.iter().any(|file| {
+            file.session.as_ref() == Some(&SessionKey::new(Provider::Codex, "child-after-large"))
+        }));
+
+        let incoming_root = root.with_extension("incoming");
+        std::fs::write(
+            &incoming_root,
+            root_header("root-large-child", Path::new("/workspace/demo")),
+        )
+        .unwrap();
+        std::fs::rename(incoming_root, &root).unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        assert!(!poll_live(&mut live, &tx).await);
+        assert!(matches!(rx.try_recv(), Ok(UiEvent::SessionReset { .. })));
+        let items = match rx.try_recv().unwrap() {
+            UiEvent::ReplayLoaded { items, .. } => items,
+            other => panic!("expected second replacement replay, got {other:?}"),
+        };
+        assert!(items.iter().any(|item| {
+            item.event.actor.0 == "child-after-large"
+                && matches!(
+                    &item.event.kind,
+                    EventKind::AssistantText { text, .. } if text == "append after large header"
+                )
+        }));
         let _ = std::fs::remove_dir_all(base);
     }
 
@@ -1200,7 +1690,7 @@ mod tests {
     fn snapshot_live_session_retains_the_original_watch_target() {
         let manifest =
             manifest_for_file(Path::new("tests/fixtures/claude/characterization.jsonl")).unwrap();
-        let snapshot = load_snapshot(&manifest);
+        let snapshot = load_snapshot(&manifest).unwrap();
         let watched = WatchTarget::LatestForCwd(PathBuf::from("/tmp/a-project"));
         let catalog = SessionCatalog::new(DiscoveryRoots::from_home(Path::new("/tmp/no-home")));
         let live = LiveSession::from_snapshot(
@@ -1208,7 +1698,7 @@ mod tests {
             catalog,
             manifest,
             snapshot.tracked,
-            snapshot.pending_metadata,
+            snapshot.pending_files,
             1.0,
         );
         assert_eq!(live.original_target, watched);
@@ -1260,13 +1750,13 @@ mod tests {
 
         let mut catalog = SessionCatalog::new(roots);
         let manifest = catalog.manifest(&WatchTarget::File(a)).unwrap();
-        let snapshot = load_snapshot(&manifest);
+        let snapshot = load_snapshot(&manifest).unwrap();
         let mut live = LiveSession::from_snapshot(
             WatchTarget::LatestForCwd(cwd),
             catalog,
             manifest,
             snapshot.tracked,
-            snapshot.pending_metadata,
+            snapshot.pending_files,
             1.0,
         );
         live.idle_ticks = SWITCH_IDLE_TICKS;
@@ -1335,11 +1825,19 @@ mod tests {
         let child = sub_dir.join("agent-bbbbbbbbbbbbbbbbb.jsonl");
         std::fs::write(
             &child,
-            format!("{}{}", claude_prompt("old child"), " ".repeat(256)),
+            format!(
+                "{}{}",
+                claude_child_output(session, "bbbbbbbbbbbbbbbbb", "old child"),
+                " ".repeat(256)
+            ),
         )
         .unwrap();
         let mut live = live_from_file(&main, roots);
-        std::fs::write(&child, claude_prompt("replacement child")).unwrap();
+        std::fs::write(
+            &child,
+            claude_child_output(session, "bbbbbbbbbbbbbbbbb", "replacement child"),
+        )
+        .unwrap();
         let (tx, mut rx) = mpsc::channel(8);
         assert!(!poll_live(&mut live, &tx).await);
         assert!(matches!(rx.try_recv(), Ok(UiEvent::SessionReset { .. })));

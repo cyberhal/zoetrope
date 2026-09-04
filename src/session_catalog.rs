@@ -1,16 +1,17 @@
 //! Native, provider-neutral session discovery.
 //!
-//! Discovery reads only bounded rollout headers. It does not parse transcript
-//! bodies; provider decoders retain ownership of that work.
+//! Automatic discovery reads only bounded rollout headers. Explicit paths and
+//! replacement readiness stream records until positive provider evidence is
+//! found; provider decoders retain ownership of transcript meaning.
 
-use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::event::{Provider, SessionKey};
+use crate::event::{Provider, SessionKey, SessionOrigin};
+use crate::formats::{SessionProbe, SessionProber, probe_session_bytes};
 use crate::transcript;
 
 pub const DEFAULT_HEADER_BYTES: usize = 64 * 1024;
@@ -104,6 +105,10 @@ struct CachedHeader {
     modified: SystemTime,
     identity: FileIdentity,
     session: Option<SessionRef>,
+    /// Once a pinned/replacement path required record streaming, later file
+    /// growth must preserve that policy instead of silently demoting it to the
+    /// automatic 64 KiB budget.
+    streaming: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,26 +160,58 @@ impl SessionCatalog {
     /// to rebuild its family. Partial and unknown content must keep the old
     /// snapshot visible until a complete replacement can be classified.
     pub(crate) fn replacement_ready(&self, path: &Path) -> bool {
-        read_explicit_codex(path, self.header_bytes).is_some()
-            || looks_like_claude(path, self.header_bytes)
+        read_streaming_probe(path, false)
+            .ok()
+            .and_then(|read| read.probe)
+            .is_some()
     }
 
     /// Resolve a replaced root without scanning the Codex history until the
     /// watched handle has a complete, valid header again.
+    #[cfg(test)]
     pub(crate) fn replacement_manifest(&mut self, path: &Path) -> Option<SessionManifest> {
-        if let Some(root) = read_explicit_codex(path, self.header_bytes) {
+        self.replacement_manifest_with_overlays(path, std::iter::empty::<&PathBuf>())
+    }
+
+    /// Rebuild a root family while preserving positively resolved changed
+    /// members that exceed the automatic discovery budget.
+    pub(crate) fn replacement_manifest_with_overlays<'a>(
+        &mut self,
+        path: &Path,
+        overlays: impl IntoIterator<Item = &'a PathBuf>,
+    ) -> Option<SessionManifest> {
+        let path = comparable_path(path);
+        let root_read = read_explicit_session_detail(&path)?;
+        let root = root_read.session.clone();
+        if root.key.provider == Provider::Codex {
             self.refresh_codex();
-            let root = self
-                .codex
-                .get(&comparable_path(path))
-                .and_then(|cached| cached.session.clone())
-                .unwrap_or(root);
-            return Some(self.manifest_for(root));
+            self.cache_explicit_codex(root_read);
+            for overlay in overlays {
+                if let Some(read) = read_explicit_session_detail(overlay)
+                    && read.session.key.provider == Provider::Codex
+                {
+                    self.cache_explicit_codex(read);
+                }
+            }
+            Some(self.manifest_for(root))
+        } else {
+            Some(claude_manifest(root))
         }
-        looks_like_claude(path, self.header_bytes)
-            .then(|| self.claude_ref(&comparable_path(path), None))
-            .flatten()
-            .map(claude_manifest)
+    }
+
+    fn cache_explicit_codex(&mut self, read: ExplicitSession) {
+        let path = read.session.path.clone();
+        let identity = file_identity(&read.metadata);
+        self.codex.insert(
+            path,
+            CachedHeader {
+                len: read.metadata.len(),
+                modified: read.metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                identity,
+                session: Some(read.session),
+                streaming: true,
+            },
+        );
     }
 
     pub fn candidates_for_cwd(&mut self, cwd: &Path) -> Vec<SessionRef> {
@@ -201,20 +238,11 @@ impl SessionCatalog {
             WatchTarget::File(path) => {
                 self.refresh_codex();
                 let path = comparable_path(path);
-                let codex = self
+                let root = self
                     .codex
                     .get(&path)
                     .and_then(|cached| cached.session.clone())
-                    .or_else(|| read_explicit_codex(&path, self.header_bytes));
-                let root = match codex {
-                    Some(session) => session,
-                    None if looks_like_claude(&path, self.header_bytes)
-                        || !is_rollout_name(&path) =>
-                    {
-                        self.claude_ref(&path, None)?
-                    }
-                    None => return None,
-                };
+                    .or_else(|| read_explicit_session(&path))?;
                 Some(self.manifest_for(root))
             }
         }
@@ -271,7 +299,7 @@ impl SessionCatalog {
                     && session
                         .cwd
                         .as_deref()
-                        .is_some_and(|cwd| comparable_path(cwd) == wanted)
+                        .is_some_and(|cwd| cwd.is_absolute() && comparable_path(cwd) == wanted)
             })
             .map(|root| {
                 let mut candidate = (*root).clone();
@@ -313,20 +341,32 @@ impl SessionCatalog {
                 continue;
             }
             self.last_stats.candidates_read += 1;
-            let session = read_codex_header(
-                &path,
-                metadata.len(),
-                modified,
-                self.header_bytes,
-                &mut self.last_stats.bytes_read,
-            );
+            let stream_known_path = self.codex.get(&path).is_some_and(|cached| cached.streaming);
+            let read = if stream_known_path {
+                read_streaming_probe(&path, false).ok()
+            } else {
+                read_bounded_probe(&path, self.header_bytes).ok()
+            };
+            let (len, modified, identity, session) = if let Some(read) = read {
+                self.last_stats.bytes_read += read.bytes_read;
+                let len = read.metadata.len();
+                let modified = read.metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                let identity = file_identity(&read.metadata);
+                let session = read
+                    .probe
+                    .and_then(|probe| codex_ref_from_probe(&path, modified, probe));
+                (len, modified, identity, session)
+            } else {
+                (metadata.len(), modified, identity, None)
+            };
             self.codex.insert(
                 path,
                 CachedHeader {
-                    len: metadata.len(),
+                    len,
                     modified,
                     identity,
                     session,
+                    streaming: stream_known_path,
                 },
             );
         }
@@ -583,75 +623,84 @@ fn is_rollout_name(path: &Path) -> bool {
             .is_some_and(|stem| stem.starts_with("rollout-"))
 }
 
-#[derive(Deserialize)]
-struct SessionMetaLine {
-    #[serde(rename = "type")]
-    kind: String,
-    payload: SessionMetaPayload,
-}
-#[derive(Deserialize)]
-struct SessionMetaPayload {
-    id: String,
-    cwd: PathBuf,
-    #[serde(default)]
-    source: Option<serde_json::Value>,
-    #[serde(default)]
-    parent_thread_id: Option<String>,
-    #[serde(default)]
-    agent_path: Option<String>,
+struct BoundedProbe {
+    metadata: fs::Metadata,
+    probe: Option<SessionProbe>,
+    bytes_read: usize,
 }
 
-fn read_codex_header(
-    path: &Path,
-    file_len: u64,
-    modified: SystemTime,
-    limit: usize,
-    bytes_read: &mut usize,
-) -> Option<SessionRef> {
-    let mut file = fs::File::open(path).ok()?;
+fn read_bounded_probe(path: &Path, limit: usize) -> std::io::Result<BoundedProbe> {
+    let mut file = fs::File::open(path)?;
+    let metadata = file.metadata()?;
     let mut bytes = Vec::new();
-    file.by_ref()
-        .take(limit as u64)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    *bytes_read += bytes.len();
-    let first = match bytes.iter().position(|byte| *byte == b'\n') {
-        Some(end) => &bytes[..end],
-        None if file_len <= bytes.len() as u64 => bytes.as_slice(),
-        None => return None,
-    };
-    let line: SessionMetaLine = serde_json::from_slice(first).ok()?;
-    if line.kind != "session_meta" || line.payload.id.is_empty() || !line.payload.cwd.is_absolute()
-    {
-        return None;
+    file.by_ref().take(limit as u64).read_to_end(&mut bytes)?;
+    let bytes_read = bytes.len();
+    let at_eof = metadata.len() <= bytes_read as u64;
+    Ok(BoundedProbe {
+        metadata,
+        probe: probe_session_bytes(&bytes, at_eof),
+        bytes_read,
+    })
+}
+
+/// Probe a pinned file without imposing the automatic discovery budget.
+/// Fixed-size chunks and [`SessionProber`]'s per-record cap keep memory bounded
+/// even when positive evidence follows a long preamble or malformed record.
+fn read_streaming_probe(
+    path: &Path,
+    continue_until_claude_id: bool,
+) -> std::io::Result<BoundedProbe> {
+    let mut file = fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    let mut prober = SessionProber::default();
+    let mut chunk = [0_u8; 64 * 1024];
+    let mut bytes_read = 0;
+    loop {
+        let read = file.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        bytes_read += read;
+        prober.push_bytes(&chunk[..read]);
+        match prober.probe() {
+            Some(SessionProbe::Codex(_)) => break,
+            Some(SessionProbe::Claude(identity))
+                if !continue_until_claude_id || identity.first_session_id().is_some() =>
+            {
+                break;
+            }
+            Some(SessionProbe::Claude(_)) | None => {}
+        }
     }
-    let source = line.payload.source.as_ref()?;
-    let thread_spawn = source.pointer("/subagent/thread_spawn");
-    let auxiliary = source.pointer("/subagent/other").is_some();
-    let kind = if thread_spawn.is_some() {
-        SessionKind::Spawned
-    } else if auxiliary || source.get("subagent").is_some() {
-        SessionKind::Auxiliary
-    } else {
-        SessionKind::Root
+    Ok(BoundedProbe {
+        metadata,
+        probe: prober.finish(),
+        bytes_read,
+    })
+}
+
+fn codex_ref_from_probe(
+    path: &Path,
+    modified: SystemTime,
+    probe: SessionProbe,
+) -> Option<SessionRef> {
+    let SessionProbe::Codex(metadata) = probe else {
+        return None;
     };
-    let parent_thread_id = thread_spawn
-        .and_then(|value| value.get("parent_thread_id"))
-        .and_then(|value| value.as_str())
-        .map(str::to_owned)
-        .or(line.payload.parent_thread_id);
-    let agent_path = thread_spawn
-        .and_then(|value| value.get("agent_path"))
-        .and_then(|value| value.as_str())
-        .map(str::to_owned)
-        .or(line.payload.agent_path);
+    let cwd = metadata.cwd.map(PathBuf::from);
+    let (kind, parent_thread_id, agent_path) = match metadata.origin {
+        SessionOrigin::TopLevel => (SessionKind::Root, None, None),
+        SessionOrigin::ThreadSpawn {
+            parent_thread_id,
+            agent_path,
+            ..
+        } => (SessionKind::Spawned, Some(parent_thread_id), agent_path),
+        SessionOrigin::Auxiliary | SessionOrigin::Unknown => (SessionKind::Auxiliary, None, None),
+    };
     Some(SessionRef {
-        key: SessionKey {
-            provider: Provider::Codex,
-            id: line.payload.id,
-        },
+        key: metadata.session,
         path: path.to_owned(),
-        cwd: Some(line.payload.cwd),
+        cwd,
         kind,
         parent_thread_id,
         agent_path,
@@ -659,58 +708,50 @@ fn read_codex_header(
     })
 }
 
-fn read_explicit_codex(path: &Path, limit: usize) -> Option<SessionRef> {
-    let metadata = fs::metadata(path).ok()?;
-    if !metadata.is_file() {
-        return None;
-    }
-    let mut ignored = 0;
-    read_codex_header(
-        path,
-        metadata.len(),
-        metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-        limit,
-        &mut ignored,
-    )
+struct ExplicitSession {
+    session: SessionRef,
+    metadata: fs::Metadata,
 }
 
-fn looks_like_claude(path: &Path, limit: usize) -> bool {
-    let Ok(mut file) = fs::File::open(path) else {
-        return false;
-    };
-    let mut bytes = Vec::new();
-    if file
-        .by_ref()
-        .take(limit as u64)
-        .read_to_end(&mut bytes)
-        .is_err()
-    {
-        return false;
-    }
-    let end = bytes
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .unwrap_or(bytes.len());
-    serde_json::from_slice::<serde_json::Value>(&bytes[..end])
-        .ok()
-        .and_then(|value| value.get("type")?.as_str().map(str::to_owned))
-        .is_some_and(|kind| {
-            matches!(
-                kind.as_str(),
-                "user"
-                    | "assistant"
-                    | "system"
-                    | "attachment"
-                    | "ai-title"
-                    | "last-prompt"
-                    | "mode"
-                    | "permission-mode"
-                    | "file-history-snapshot"
-                    | "queue-operation"
-                    | "started"
-                    | "result"
-            )
-        })
+fn read_explicit_session_detail(path: &Path) -> Option<ExplicitSession> {
+    let read = read_streaming_probe(path, true).ok()?;
+    let modified = read.metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let session = match read.probe {
+        Some(probe @ SessionProbe::Codex(_)) => codex_ref_from_probe(path, modified, probe),
+        Some(SessionProbe::Claude(identity)) => {
+            let id = identity
+                .first_session_id()
+                .map(str::to_owned)
+                .or_else(|| path.file_stem()?.to_str().map(str::to_owned))?;
+            Some(SessionRef {
+                key: SessionKey::new(Provider::Claude, id),
+                path: path.to_owned(),
+                cwd: None,
+                kind: SessionKind::Root,
+                parent_thread_id: None,
+                agent_path: None,
+                modified,
+            })
+        }
+        None if transcript::is_session_file(path) => Some(SessionRef {
+            key: SessionKey::new(Provider::Claude, path.file_stem()?.to_str()?.to_owned()),
+            path: path.to_owned(),
+            cwd: None,
+            kind: SessionKind::Root,
+            parent_thread_id: None,
+            agent_path: None,
+            modified,
+        }),
+        None => None,
+    }?;
+    Some(ExplicitSession {
+        session,
+        metadata: read.metadata,
+    })
+}
+
+fn read_explicit_session(path: &Path) -> Option<SessionRef> {
+    read_explicit_session_detail(path).map(|read| read.session)
 }
 
 #[cfg(test)]
@@ -789,6 +830,11 @@ mod tests {
         tree.rollout("01", "helper", &format!(r#"{{"type":"session_meta","payload":{{"id":"helper","cwd":{},"source":{{"subagent":{{"other":"guardian"}}}}}}}}"#, serde_json::to_string(&cwd).unwrap()));
         tree.rollout("01", "malformed", "not json");
         tree.rollout("01", "empty-cwd", &root("empty-cwd", Path::new("")));
+        tree.rollout(
+            "01",
+            "relative-cwd",
+            &root("relative-cwd", Path::new("work")),
+        );
         let noise = tree.0.join("codex/2026/09/01/rollout-directory.jsonl");
         fs::create_dir_all(&noise).unwrap();
 
@@ -1075,10 +1121,159 @@ mod tests {
     }
 
     #[test]
+    fn explicit_provider_detection_skips_wrong_shaped_noise_before_codex_header() {
+        let tree = TempTree::new("provider-collision");
+        let cwd = tree.0.join("work");
+        let path = tree.0.join("recording.jsonl");
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                r#"{"type":"user"}"#,
+                root("actual-thread", &cwd)
+            ),
+        )
+        .unwrap();
+        let mut catalog = SessionCatalog::new(tree.roots());
+
+        let manifest = catalog.manifest(&WatchTarget::File(path)).unwrap();
+        assert_eq!(
+            manifest.root.key,
+            SessionKey::new(Provider::Codex, "actual-thread")
+        );
+    }
+
+    #[test]
+    fn whitespace_codex_identity_is_not_provider_evidence() {
+        let tree = TempTree::new("whitespace-id");
+        let cwd = tree.0.join("work");
+        let path = tree.rollout(
+            "01",
+            "blank",
+            &format!(
+                r#"{{"type":"session_meta","payload":{{"id":"  ","cwd":{},"source":"cli"}}}}"#,
+                serde_json::to_string(&cwd).unwrap()
+            ),
+        );
+        let mut catalog = SessionCatalog::new(tree.roots());
+
+        assert!(catalog.candidates_for_cwd(&cwd).is_empty());
+        assert!(catalog.manifest(&WatchTarget::File(path)).is_none());
+    }
+
+    #[test]
+    fn replacement_readiness_uses_the_shared_positive_probe() {
+        let tree = TempTree::new("replacement-probe");
+        let cwd = tree.0.join("work");
+        let path = tree.0.join("recording.jsonl");
+        let catalog = SessionCatalog::new(tree.roots());
+
+        fs::write(&path, r#"{"type":"user"}"#).unwrap();
+        assert!(!catalog.replacement_ready(&path));
+
+        fs::write(
+            &path,
+            format!("{}\n{}", r#"{"type":"user"}"#, root("ready", &cwd)),
+        )
+        .unwrap();
+        assert!(catalog.replacement_ready(&path));
+
+        fs::write(
+            &path,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[]}}"#,
+        )
+        .unwrap();
+        assert!(catalog.replacement_ready(&path));
+    }
+
+    #[test]
+    fn explicit_and_replacement_probe_past_the_automatic_discovery_budget() {
+        let tree = TempTree::new("explicit-large-record-scan");
+        let cwd = tree.0.join("work");
+        let mut text = serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "id": "late-header",
+                "cwd": cwd,
+                "source": "cli",
+                "padding": "x".repeat(DEFAULT_HEADER_BYTES + 4096),
+            }
+        })
+        .to_string();
+        assert!(text.len() > DEFAULT_HEADER_BYTES);
+        text.push('\n');
+        let path = tree.rollout("01", "late-header", &text);
+        let mut catalog = SessionCatalog::new(tree.roots());
+
+        assert!(
+            catalog.candidates_for_cwd(&cwd).is_empty(),
+            "automatic discovery stays within its 64 KiB budget"
+        );
+        let manifest = catalog
+            .manifest(&WatchTarget::File(path.clone()))
+            .expect("a pinned path scans complete records past that budget");
+        assert_eq!(
+            manifest.root.key,
+            SessionKey::new(Provider::Codex, "late-header")
+        );
+        assert!(catalog.replacement_ready(&path));
+        assert_eq!(
+            catalog.replacement_manifest(&path).unwrap().root.key,
+            SessionKey::new(Provider::Codex, "late-header")
+        );
+        assert_eq!(
+            crate::formats::detect_session(&text),
+            (Provider::Codex, Some("late-header".into())),
+            "portable and native probes share classification semantics"
+        );
+    }
+
+    #[test]
+    fn streaming_probe_stops_after_a_decisive_header_chunk() {
+        let tree = TempTree::new("streaming-probe-early-stop");
+        let cwd = tree.0.join("work");
+        let cases = [
+            (
+                "codex.jsonl",
+                format!("{}\n", root("codex-early", &cwd)),
+                Provider::Codex,
+            ),
+            (
+                "claude.jsonl",
+                concat!(
+                    r#"{"type":"user","sessionId":"claude-early","message":{"role":"user","content":"start"}}"#,
+                    "\n"
+                )
+                .to_owned(),
+                Provider::Claude,
+            ),
+        ];
+        for (name, header, expected_provider) in cases {
+            let path = tree.0.join(name);
+            let mut contents = header.into_bytes();
+            contents.extend(std::iter::repeat_n(b'x', 2 * 1024 * 1024));
+            fs::write(&path, &contents).unwrap();
+
+            let read = read_streaming_probe(&path, true).unwrap();
+            let provider = match read.probe.unwrap() {
+                SessionProbe::Codex(_) => Provider::Codex,
+                SessionProbe::Claude(_) => Provider::Claude,
+            };
+            assert_eq!(provider, expected_provider);
+            assert!(read.bytes_read <= 64 * 1024);
+            assert!(read.bytes_read < read.metadata.len() as usize);
+        }
+    }
+
+    #[test]
     fn explicit_claude_file_named_like_a_rollout_is_content_sniffed() {
         let tree = TempTree::new("claude-rollout-name");
         let path = tree.0.join("rollout-copy.jsonl");
-        fs::write(&path, r#"{"type":"user","message":{"content":"hello"}}"#).unwrap();
+        fs::write(
+            &path,
+            r#"{"type":"user","message":{"role":"user","content":"hello"}}"#,
+        )
+        .unwrap();
         let mut catalog = SessionCatalog::new(tree.roots());
 
         let manifest = catalog.manifest(&WatchTarget::File(path)).unwrap();

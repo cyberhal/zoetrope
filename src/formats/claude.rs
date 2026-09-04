@@ -106,7 +106,7 @@ impl ClaudeDecoder {
             Entry::Assistant(entry) => self.decode_assistant(*entry, &mut events),
             Entry::User(entry) => self.decode_user(*entry, &mut events),
             Entry::Started(entry) if matches!(self.source, ClaudeFile::WorkflowJournal { .. }) => {
-                if let Some(agent_id) = entry.agent_id.filter(|id| !id.is_empty()) {
+                if let Some(agent_id) = entry.agent_id.filter(|id| !id.trim().is_empty()) {
                     events.push(SessionEvent {
                         actor: self.actor(),
                         time: EventTime::AtAgentStart(ActorId(agent_id.clone())),
@@ -118,7 +118,7 @@ impl ClaudeDecoder {
                 }
             }
             Entry::Result(entry) if matches!(self.source, ClaudeFile::WorkflowJournal { .. }) => {
-                if let Some(agent_id) = entry.agent_id.filter(|id| !id.is_empty()) {
+                if let Some(agent_id) = entry.agent_id.filter(|id| !id.trim().is_empty()) {
                     events.push(SessionEvent {
                         actor: self.actor(),
                         time: EventTime::AtAgentEnd(ActorId(agent_id.clone())),
@@ -201,6 +201,21 @@ impl ClaudeDecoder {
         events: &mut Vec<SessionEvent>,
     ) {
         let timestamp = entry.envelope.timestamp;
+        let fact_scope = entry
+            .envelope
+            .uuid
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .map(|id| format!("uuid:{id}"))
+            .or_else(|| {
+                entry
+                    .envelope
+                    .request_id
+                    .as_deref()
+                    .filter(|id| !id.trim().is_empty())
+                    .map(|id| format!("request:{id}"))
+            })
+            .unwrap_or_else(|| format!("line:{}", self.sequence));
         let Some(message) = entry.message else { return };
         if let Some(model) = message.model.filter(|model| !model.trim().is_empty()) {
             events.push(self.event(timestamp, EventKind::ModelSelected { model }));
@@ -211,7 +226,7 @@ impl ClaudeDecoder {
             let scope = entry
                 .envelope
                 .request_id
-                .filter(|id| !id.is_empty())
+                .filter(|id| !id.trim().is_empty())
                 .unwrap_or_else(|| format!("line:{}", self.sequence));
             let revision = self.seen_usage.entry(scope.clone()).or_default();
             *revision = revision.saturating_add(1);
@@ -231,7 +246,7 @@ impl ClaudeDecoder {
         }
 
         let mut nearest = self.latest_context.clone();
-        for block in message.content {
+        for (block_index, block) in message.content.into_iter().enumerate() {
             match block {
                 ContentBlock::Text { text } if !text.trim().is_empty() => {
                     nearest = Some(excerpt(&text));
@@ -239,6 +254,7 @@ impl ClaudeDecoder {
                     events.push(self.event(
                         timestamp,
                         EventKind::AssistantText {
+                            fact_id: format!("{fact_scope}:text:{block_index}"),
                             channel: AssistantChannel::Other("assistant".to_owned()),
                             text,
                         },
@@ -247,11 +263,17 @@ impl ClaudeDecoder {
                 ContentBlock::Thinking { thinking, .. } if !thinking.trim().is_empty() => {
                     nearest = Some(excerpt(&thinking));
                     self.latest_context = nearest.clone();
-                    events.push(self.event(timestamp, EventKind::Reasoning { text: thinking }));
+                    events.push(self.event(
+                        timestamp,
+                        EventKind::Reasoning {
+                            fact_id: format!("{fact_scope}:reasoning:{block_index}"),
+                            text: thinking,
+                        },
+                    ));
                 }
                 ContentBlock::ToolUse(tool) => {
                     let (Some(id), Some(name)) = (
-                        tool.id.filter(|id| !id.is_empty()),
+                        tool.id.filter(|id| !id.trim().is_empty()),
                         tool.name.filter(|name| !name.is_empty()),
                     ) else {
                         continue;
@@ -337,7 +359,7 @@ impl ClaudeDecoder {
         {
             for block in blocks {
                 if let UserContentBlock::ToolResult(result) = block
-                    && let Some(id) = result.tool_use_id.filter(|id| !id.is_empty())
+                    && let Some(id) = result.tool_use_id.filter(|id| !id.trim().is_empty())
                     && self.seen_results.insert(id.clone())
                 {
                     events.push(self.event(

@@ -37,7 +37,11 @@ pub(crate) async fn run_replay(
     })
     .await
     {
-        Ok(snapshot) => snapshot,
+        Ok(Ok(snapshot)) => snapshot,
+        Ok(Err(error)) => {
+            let _ = ui_tx.send(UiEvent::Error(error.to_string())).await;
+            return Flow::Reattach;
+        }
         Err(error) => {
             let _ = ui_tx
                 .send(UiEvent::Error(format!("failed to load session: {error}")))
@@ -46,6 +50,15 @@ pub(crate) async fn run_replay(
         }
     };
     let session = snapshot.key.clone();
+    if ui_tx
+        .send(UiEvent::SessionReset {
+            session: session.clone(),
+        })
+        .await
+        .is_err()
+    {
+        return Flow::Exit;
+    }
     if ui_tx
         .send(UiEvent::ReplayLoaded {
             session: session.clone(),
@@ -66,7 +79,7 @@ pub(crate) async fn run_replay(
         catalog,
         manifest,
         snapshot.tracked,
-        snapshot.pending_metadata,
+        snapshot.pending_files,
         if speed > 0.0 { speed } else { 1.0 },
     );
     tail_loop(live, ui_tx, req_rx).await
@@ -75,7 +88,8 @@ pub(crate) async fn run_replay(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::EventKind;
+    use crate::event::{EventKind, Provider, SessionKey};
+    use crate::state::{App, Mode};
     use std::io::Write;
 
     #[test]
@@ -99,7 +113,7 @@ mod tests {
         std::fs::write(
             sub_dir.join("agent-aaaaaaaaaaaaaaaaa.jsonl"),
             concat!(
-                r#"{"type":"user","uuid":"s1","isSidechain":true,"agentId":"aaaaaaaaaaaaaaaaa","timestamp":"2026-06-05T10:01:00Z","message":{"role":"user","content":"task"}}"#,
+                r#"{"type":"user","uuid":"s1","sessionId":"55555555-5555-5555-5555-555555555555","isSidechain":true,"agentId":"aaaaaaaaaaaaaaaaa","timestamp":"2026-06-05T10:01:00Z","message":{"role":"user","content":"task"}}"#,
                 "\n",
             ),
         )
@@ -111,7 +125,7 @@ mod tests {
         .unwrap();
 
         let manifest = crate::session_loader::manifest_for_file(&main).unwrap();
-        let snapshot = load_snapshot(&manifest);
+        let snapshot = load_snapshot(&manifest).unwrap();
         let discovered = snapshot
             .items
             .iter()
@@ -138,6 +152,54 @@ mod tests {
             discovered < child,
             "birth metadata sorts before child activity"
         );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn replay_adopts_the_identity_from_its_own_parse_window() {
+        let base = std::env::temp_dir().join(format!(
+            "zoetrope_replay_identity_window_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("recording.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"session-b","source":"cli"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","id":"b-message","role":"assistant","content":[{"type":"output_text","text":"from B"}]}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        // The foreground parse saw A; the tailer parse, after an atomic
+        // replacement in the real race, sees B. Its reset must make the replay
+        // observable instead of letting App's stale-session guard discard it.
+        let mut app = App::new(SessionKey::new(Provider::Codex, "session-a"), Mode::Live);
+        let (ui_tx, mut ui_rx) = mpsc::channel(8);
+        let (req_tx, mut req_rx) = mpsc::channel(1);
+        drop(req_tx);
+        assert!(matches!(
+            run_replay(&WatchTarget::File(path), &ui_tx, &mut req_rx, 1.0).await,
+            Flow::Exit
+        ));
+        drop(ui_tx);
+        while let Some(event) = ui_rx.recv().await {
+            app.handle_ui_event(event);
+        }
+
+        assert_eq!(
+            app.current_session,
+            SessionKey::new(Provider::Codex, "session-b")
+        );
+        assert!(app.timeline.items.iter().any(|item| matches!(
+            &item.event.kind,
+            EventKind::AssistantText { text, .. } if text == "from B"
+        )));
+        assert!(app.session.agent("main").is_some());
         let _ = std::fs::remove_dir_all(base);
     }
 }

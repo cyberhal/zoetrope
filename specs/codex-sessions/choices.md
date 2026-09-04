@@ -49,6 +49,78 @@
 
 ## Sound
 
+### Semantic content identity belongs to provider adapters
+
+- **When:** Slice 06 (`codex-review-fixes`).
+- **The choice:** Assistant text and reasoning carry a stable fact id chosen by the provider adapter. Codex uses its response-item id, falling back to turn plus content; Claude uses its envelope UUID or request id plus block position, falling back to stream position. The model de-duplicates by actor, fact kind, and that id—not by displayed words. Thus two turns may both honestly say `Done.`, while a mirrored copy of one provider fact still appears once.
+- **The gap:** The event model required order-independent de-duplication but did not identify repeated textual facts independently of their content.
+- **The reach:** Every replay, seek, and live fold can preserve legitimate repetition without learning provider wire ids.
+- **Verdict:** sound — adapters own wire identity and the model owns only semantic idempotence.
+- **Confidence:** high.
+
+### Manifest validation and decoding share one open file handle
+
+- **When:** Slice 06 (`codex-review-fixes`).
+- **The choice:** Initial snapshots and late attachments read bytes and file identity from one handle, positively classify those bytes, validate them against the selected manifest, and only then expose facts and the continued decoder. Codex children must match their thread and parent. Claude subagent files validate every session and actor id on every strictly decoded record the adapter could consume, including records that do not independently provide positive provider evidence; workflow journals may name several actors but may not cross session families. A path changed from session A to B therefore cannot combine A's key with B's content, even if replacement happens between cataloging and opening.
+- **The gap:** Earlier slice contracts covered tail rotation but did not define the catalog-to-first-open race.
+- **The reach:** Root and child files fail closed across same-provider, cross-provider, actor-mismatch, invalid UTF-8, and incomplete replacements. Provider recognition still requires a positive record, so unrelated JSON cannot claim Claude merely by carrying identity-shaped fields. A non-root path without positive evidence stays unattached, so completing a foreign header cannot poison its decoder and a later valid family member can still attach.
+- **Verdict:** sound — identity and content are accepted atomically at the loader boundary.
+- **Confidence:** high.
+
+### Physical EOF completes valid JSON but not partial JSON
+
+- **When:** Slice 06 (`codex-review-fixes`).
+- **The choice:** When a tail read reaches the current physical end of a file, a buffered tail that independently parses as JSON is emitted immediately. Its bytes remain marked through trailing whitespace and a segmented carriage-return/newline until the delimiter arrives, so those writes cannot emit it twice. A syntactically incomplete tail stays buffered until more bytes arrive; the existing 8 MiB record cap still applies to retained EOF state.
+- **The gap:** JSONL normally uses newlines, but valid rollout records can be visible before the writer appends the delimiter; the plan required live/bulk convergence without specifying this framing boundary.
+- **The reach:** Fresh snapshots, late child attachment, and already-followed files observe the same final record exactly once.
+- **Verdict:** sound — syntax provides the completion evidence while the framing state preserves exact-once delivery.
+- **Confidence:** high.
+
+### Synthetic child metadata follows validated file membership
+
+- **When:** Slice 06 (`codex-review-fixes`).
+- **The choice:** Snapshot and reload retain manifest metadata only for child session files that passed same-handle validation. A pending child is not marked as already announced; when it later attaches, its discovery fact is delivered exactly once with the recorded parent.
+- **The gap:** A manifest can know a child's header before the loader successfully opens that same file, so catalog membership alone cannot prove that its facts belong in the accepted snapshot.
+- **The reach:** Synthetic placeholders cannot leak from a raced or partial file, and a transiently unavailable child does not permanently lose its discovery event.
+- **Verdict:** sound — metadata visibility and decoder attachment use the same accepted-file set.
+- **Confidence:** high.
+
+### The 64 KiB read ceiling belongs only to automatic discovery
+
+- **When:** Slice 06 (`codex-review-fixes`).
+- **The choice:** Automatic history scans still read at most 64 KiB per candidate. Explicit files and replacement readiness instead feed the shared positive classifier fixed-size chunks until a complete provider record is found, with an 8 MiB cap on any one unfinished record. They may therefore recognize a valid header after the automatic budget without reading an entire rollout into memory.
+- **The gap:** Applying the discovery ceiling to a user-pinned file silently contradicted the explicit replay promise; removing every bound would expose refresh and probing to corrupt or hostile records.
+- **The reach:** A large but valid header is deliberately ineligible for cwd auto-selection yet remains inspectable and can become replacement-ready. During reload, streaming-resolved changed members overlay the fresh bounded catalog before family closure, so a previously tracked child is not lost merely because its replacement header exceeds 64 KiB. Native and portable paths use the same record predicate.
+- **Verdict:** sound — bounded broad discovery and bounded-memory explicit parsing serve different trust and latency contracts.
+- **Confidence:** high.
+
+### Claude identity probing retains bounded conflict evidence
+
+- **When:** Slice 06 (`codex-review-fixes`).
+- **The choice:** For session and actor identity independently, the stateful probe retains the first distinct value and at most one conflicting value. One value proves consistency; two prove that no single expected manifest identity can match every record. Individual unfinished records remain capped at 8 MiB.
+- **The gap:** Retaining every unique actor from a long workflow journal makes a provider classifier's memory proportional to transcript history even though validation needs only consistency evidence.
+- **The reach:** Claude subagent family validation remains fail-closed for any number of conflicting records, while legitimate multi-actor workflow journals do not grow the probe's identity state without bound.
+- **Verdict:** sound — the summary preserves exactly the evidence consumed by validation and nothing else.
+- **Confidence:** high.
+
+### Decoder-confirmed replay identity supersedes foreground selection
+
+- **When:** Slice 06 (`codex-review-fixes`).
+- **The choice:** The background replay loader announces the provider-qualified identity it actually decoded before sending replay items. If a pinned path changed after the foreground selected session A but before replay opened it, the app resets to B and accepts B's items instead of dropping them as stale.
+- **The gap:** The CLI and tailer necessarily have separate scheduling windows, but the earlier contract did not say which parse owns the final app identity.
+- **The reach:** Explicit TUI replay remains coherent under atomic file replacement without weakening stale-batch rejection.
+- **Verdict:** sound — the parse that supplies the content must also supply the identity guarding that content.
+- **Confidence:** high.
+
+### Unwritten canonical Claude files retain their permissive retry sentinel
+
+- **When:** Slice 06 (`codex-review-fixes`).
+- **The choice:** An explicit canonical Claude UUID file containing only whitespace or empty JSON objects may seed an empty live snapshot while waiting for a writer. Any other nonempty content without positive provider evidence is retried instead of permanently seeding a Claude decoder; this keeps an incomplete Codex replacement from being misclassified.
+- **The gap:** Positive provider validation conflicts with the established workflow that pins a Claude path before its first real record exists.
+- **The reach:** Existing empty-file live startup remains available, while incomplete cross-provider replacements fail closed.
+- **Verdict:** sound — the narrow sentinel preserves compatibility without restoring generic filename-based provider guessing.
+- **Confidence:** medium.
+
 ### Portable Claude identity uses recorded metadata, then the caller's selected filename
 
 - **When:** Slice 05 (`codex-slice5`).
@@ -142,7 +214,7 @@
 ### Snapshot handoff transfers decoder state and retryable metadata
 
 - **When:** Slice 03 (`codex-slice3`).
-- **The choice:** Each tracked file crosses snapshot-to-tail with its consumed byte offset, file identity, and mutated decoder. Snapshot bytes and identity come from the same open handle. A syntactically complete final JSON record is consumed even without a trailing newline, while an incomplete tail stays unread. Codex decoders are not finalized at a temporary EOF. Known transcripts that are temporarily unreadable remain tracked with their provider decoder at offset zero, and Claude sidecars that are unreadable or malformed remain pending, so live polling retries both after the writer finishes.
+- **The choice:** Each tracked file crosses snapshot-to-tail with its consumed byte offset, file identity, and mutated decoder. Snapshot bytes and identity come from the same open handle. A syntactically complete final JSON record is consumed even without a trailing newline, while an incomplete tail stays unread. Codex decoders are not finalized at a temporary EOF. Known files that are unreadable or lack complete provider evidence remain pending for a fresh validated attachment; Claude metadata sidecars likewise remain pending until valid.
 - **The gap:** Offsets alone suppress appended Codex child activity by losing the owned-turn gate; separate open/stat operations can seed mismatched identity; dropping an unreadable manifest file prevents later recovery; and treating a mid-write sidecar as consumed leaves an agent permanently unparented.
 - **The reach:** Appends between bulk load and tail start are delivered once, complete last records are not lost, partial records are not consumed early, same-size replacement is detected on the first stat, and transient transcript or sidecar writes recover without a restart.
 - **Verdict:** sound — all parsing state needed to continue a stream moves with the stream cursor.
@@ -196,7 +268,7 @@
 ### Discovery caps every candidate header read at 64 KiB
 
 - **When:** Slice 02 (`codex-slice2`).
-- **The choice:** The catalog reads no more than 64 KiB from a candidate rollout to obtain its first metadata record. A larger or malformed header is ineligible for automatic discovery but can still be opened explicitly and decoded defensively. The unbuilt alternative is to keep reading until a complete first line appears, which lets one hostile or corrupt file turn discovery into an unbounded history read.
+- **The choice:** The catalog reads no more than 64 KiB from a candidate rollout during automatic discovery. A larger or later header is ineligible for automatic selection but remains available to the separately bounded-memory explicit path. The unbuilt alternative is to keep reading until a complete line appears during every history scan, which lets one hostile or corrupt file turn discovery into an unbounded read.
 - **The gap:** The plan requires bounded discovery but leaves the concrete ceiling to implementation.
 - **The reach:** The bound protects every native refresh. Observed valid headers are substantially smaller, and tests pin both the bound and malformed-file behavior.
 - **Verdict:** sound — a fixed generous ceiling enforces the read-only catalog's resource contract without changing valid observed inputs.

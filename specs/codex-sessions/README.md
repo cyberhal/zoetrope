@@ -4,12 +4,14 @@ Add first-class Codex session support without weakening Zoetrope's existing Clau
 
 ## Next Agent Prompt
 
-Status: Slices 01–04 are integrated on `main` at `f200442`; Slice 05 is complete
-and independently reviewed on `codex-slice5`, pending integration. Last updated
-2026-09-04.
+Status: Slices 01–05 are integrated on `main` at `a2fae64`. The feature-wide
+review found five correctness gaps; [Slice 06](slices/06-feature-review-remediation.md)
+implements their remediation plus four first-recheck extensions on
+`codex-review-fixes`. All gates are green and the original reviewer's second
+directed recheck is pending. Last updated 2026-09-04.
 
-Integrate [Slice 05](slices/05-browser-docs-and-integration.md), then run the
-feature-wide integration review and closeout without archiving this spec first.
+Finish Slice 06, integrate it, then close the feature without archiving this
+spec first.
 Portable replay now preserves the actual provider-qualified session key and
 stateful per-file decoders for browser appends. Live following keeps
 one ordered tracker and decoder per manifest file, refreshes Codex families on
@@ -42,6 +44,7 @@ Global checklist:
 - [x] [Slice 03](slices/03-core-replay-and-inspect.md): cut the model, replay, and inspect over to normalized events (`ee3027b`)
 - [x] [Slice 04](slices/04-codex-families-and-live-follow.md): nested Codex families and live follow (`f200442`)
 - [x] [Slice 05](slices/05-browser-docs-and-integration.md): browser floor, copy/docs, cleanup, and clean slice review (`codex-slice5`)
+- [x] [Slice 06](slices/06-feature-review-remediation.md): feature-wide review remediation and clean directed recheck (`codex-review-fixes`)
 
 ## Outcome and observable behavior
 

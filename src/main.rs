@@ -139,7 +139,7 @@ async fn run_inspect(file: PathBuf) -> Result<()> {
     }
     let manifest = manifest_for_file(&file)
         .ok_or_else(|| anyhow!("unrecognized session file: {}", file.display()))?;
-    let snapshot = load_snapshot(&manifest);
+    let snapshot = load_snapshot(&manifest).context("loading session snapshot")?;
     let mut model = SessionModel::new(snapshot.key);
     for item in &snapshot.items {
         model.apply_event(&item.event);
@@ -476,7 +476,7 @@ mod tests {
         .unwrap();
 
         let manifest = manifest_for_file(&tmp).expect("manifest");
-        let snapshot = load_snapshot(&manifest);
+        let snapshot = load_snapshot(&manifest).unwrap();
         let mut model = SessionModel::new(snapshot.key);
         for item in &snapshot.items {
             model.apply_event(&item.event);
