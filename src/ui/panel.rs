@@ -527,6 +527,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn codex_exec_command_is_readable_in_the_agent_panel() {
+        use crate::state::Mode;
+        use crate::state::session::MAIN_ID;
+        use crate::tailer::replay_from_jsonl;
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let transcript = [
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {"id": "summary-root", "cwd": "/project", "source": "cli"}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call", "call_id": "call-1", "name": "exec",
+                    "input": "const result = await tools.exec_command({cmd: \"cargo test --lib\", max_output_tokens: 1000}); text(result);"
+                }
+            }),
+        ]
+        .map(|record| record.to_string())
+        .join("\n");
+        let decoded = replay_from_jsonl(&transcript, "unused-claude-id");
+        let mut app = App::new(decoded.session, Mode::Replay);
+        for item in decoded.items {
+            app.session.apply_event(&item.event);
+        }
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal
+            .draw(|frame| render(frame, frame.area(), &mut app, MAIN_ID))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(100)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("exec exec_command: cargo test --lib"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn resolve_scroll_clamps_and_reconciles_tail() {
         // Content shorter than the viewport → always tailing, offset 0.
         assert_eq!(resolve_scroll(5, 10, 3, false), (0, true));

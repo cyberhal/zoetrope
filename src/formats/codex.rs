@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 
+use super::summary::codex_tool_summary;
 use crate::event::{
     ActorId, AgentCompletionPolicy, AgentDescriptor, AgentRole, AssistantChannel, EventKind,
     EventTime, Provider, RecordedAgentStatus, SessionEvent, SessionKey, SessionMetadata,
@@ -355,7 +356,11 @@ impl CodexDecoder {
         if !self.seen_call_starts.insert(id.clone()) {
             return Vec::new();
         }
-        let summary = input.and_then(tool_summary);
+        let cwd = self
+            .session
+            .as_ref()
+            .and_then(|session| session.cwd.as_deref());
+        let summary = input.and_then(|input| codex_tool_summary(&name, input, cwd));
         let category = if name == "spawn_agent" {
             ToolCategory::AgentSpawn
         } else {
@@ -590,29 +595,6 @@ fn goal_objective(text: &str) -> Option<String> {
     let (objective, _) = after_open.split_once("</objective>")?;
     let objective = objective.trim();
     (!objective.is_empty()).then(|| objective.to_owned())
-}
-
-fn tool_summary(input: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(input).ok()?;
-    [
-        "task_name",
-        "description",
-        "command",
-        "file_path",
-        "path",
-        "query",
-    ]
-    .into_iter()
-    .find_map(|key| value.get(key).and_then(Value::as_str))
-    .filter(|summary| !summary.trim().is_empty())
-    .map(|summary| {
-        let flat = summary.split_whitespace().collect::<Vec<_>>().join(" ");
-        if flat.chars().count() > 200 {
-            format!("{}…", flat.chars().take(199).collect::<String>())
-        } else {
-            flat
-        }
-    })
 }
 
 fn path_label(path: &str) -> Option<String> {
@@ -1017,6 +999,199 @@ mod tests {
                 EventKind::SessionInfo(_) => "session-info".to_owned(),
             })
             .collect()
+    }
+
+    fn decoded_summary(name: &str, input: &str, custom: bool) -> Option<String> {
+        let transcript = [
+            serde_json::json!({"type": "session_meta", "payload": {
+                "id": "summary-root", "cwd": "/project", "source": "cli"
+            }}),
+            serde_json::json!({"type": "response_item", "payload": {
+                "type": if custom { "custom_tool_call" } else { "function_call" },
+                "call_id": "summary-call", "name": name,
+                "input": input, "arguments": input
+            }}),
+        ]
+        .map(|record| record.to_string())
+        .join("\n");
+        let (_, events) = decode(&transcript);
+        events.into_iter().find_map(|event| match event.kind {
+            EventKind::ToolStarted(tool) => tool.summary,
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn codex_json_arguments_show_commands_paths_and_descriptions() {
+        let cases = [
+            (
+                "exec_command",
+                serde_json::json!({"cmd": "cargo test", "description": "run tests"}),
+                "cargo test",
+            ),
+            (
+                "shell",
+                serde_json::json!({"command": ["git", "status", "--short"]}),
+                "git status --short",
+            ),
+            (
+                "view_image",
+                serde_json::json!({"path": "/project/output.png"}),
+                "output.png",
+            ),
+            (
+                "spawn_agent",
+                serde_json::json!({"description": "Review the parser"}),
+                "Review the parser",
+            ),
+            (
+                "web__run",
+                serde_json::json!({"search_query": [{"q": "Rust parser docs"}]}),
+                "Rust parser docs",
+            ),
+            (
+                "write_stdin",
+                serde_json::json!({"session_id": 42, "chars": ""}),
+                "session 42",
+            ),
+            (
+                "mcp__node_repl__js",
+                serde_json::json!({"title": "Inspect the panel", "code": "console.log(panel)"}),
+                "Inspect the panel",
+            ),
+        ];
+        let actual: Vec<_> = cases
+            .iter()
+            .map(|(name, input, _)| decoded_summary(name, &input.to_string(), false))
+            .collect();
+        let expected: Vec<_> = cases
+            .iter()
+            .map(|(_, _, summary)| Some(summary.to_string()))
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn direct_patch_calls_show_relative_paths_without_patch_contents() {
+        let patch = "*** Begin Patch\n*** Update File: /project/src/旧.rs\n*** Move to: /project/src/new.rs\n@@\n-secret old text\n+new text\n*** Add File: /project-other/extra.rs\n+extra\n*** End Patch";
+        assert_eq!(
+            decoded_summary("apply_patch", patch, true).as_deref(),
+            Some("src/旧.rs, src/new.rs, /project-other/extra.rs")
+        );
+    }
+
+    #[test]
+    fn stdin_summary_requires_a_recorded_session_id() {
+        assert_eq!(
+            decoded_summary("write_stdin", r#"{"session_id":null}"#, false),
+            None
+        );
+        assert_eq!(
+            decoded_summary("write_stdin", r#"{"session_id":42}"#, false).as_deref(),
+            Some("session 42")
+        );
+    }
+
+    #[test]
+    fn code_mode_reads_nested_literal_arguments_but_does_not_resolve_expressions() {
+        let input = r#"// tools.fake({cmd: 'not a call'});
+            const example = "tools.fake({cmd: 'also not a call'})";
+            /* tools.fake({path: '/ignored'}); */
+            text(await tools.web__run({search_query: [{q: 'Rust parser docs'}]}));
+            text(await tools.write_stdin({session_id: 42, chars: ''}));
+            text(await tools.exec_command({cmd: command}));"#;
+        assert_eq!(
+            decoded_summary("exec", input, true).as_deref(),
+            Some(
+                "web__run: Rust parser docs; write_stdin: session 42; exec_command: { cmd : command }"
+            )
+        );
+    }
+
+    #[test]
+    fn code_mode_does_not_infer_commands_from_regexes_or_partial_expressions() {
+        let input = r#"const pattern = /tools.fake()/;
+            await tools.exec_command({cmd: "printf " + suffix});
+            await tools.exec_command({cmd: `echo ${value}`});"#;
+        assert_eq!(
+            decoded_summary("exec", input, true).as_deref(),
+            Some(
+                "exec_command: { cmd : \"printf \" + suffix }; exec_command: { cmd : `echo ${value}` }"
+            )
+        );
+    }
+
+    #[test]
+    fn code_mode_does_not_claim_a_literal_that_dynamic_fields_may_override() {
+        let input = r#"await tools.exec_command({cmd: 'cargo test', ...options});"#;
+        assert_eq!(
+            decoded_summary("exec", input, true).as_deref(),
+            Some("exec_command: { cmd : 'cargo test' , . . . options }")
+        );
+    }
+
+    #[test]
+    fn long_code_mode_summaries_keep_later_operations_visible() {
+        let input = format!(
+            r#"await tools.exec_command({{cmd: "{}"}});
+            await tools.view_image({{path: '/project/output.png'}});"#,
+            "检查项目 ".repeat(100)
+        );
+        let summary = decoded_summary("exec", &input, true).unwrap();
+        assert!(summary.chars().count() <= 200, "{summary}");
+        assert!(summary.starts_with("exec_command: 检查项目"), "{summary}");
+        assert!(summary.ends_with("view_image: output.png"), "{summary}");
+    }
+
+    #[test]
+    fn code_mode_summarizes_multiple_operations_without_creating_extra_calls() {
+        let transcript = [
+            serde_json::json!({"type": "session_meta", "payload": {
+                "id": "summary-root", "cwd": "/project", "source": "cli"
+            }}),
+            serde_json::json!({"type": "response_item", "payload": {
+                "type": "custom_tool_call", "call_id": "multi", "name": "exec",
+                "input": r#"// @exec: {"max_output_tokens": 1000}
+                    text(await tools.apply_patch('*** Begin Patch\n*** Update File: /project/src/main.rs\n@@\n-old\n+new\n*** End Patch'));
+                    await Promise.all([
+                        tools.exec_command({cmd: "cargo test --lib"}),
+                        tools.view_image({path: `/project/output.png`})
+                    ]);"#
+            }}),
+            serde_json::json!({"type": "response_item", "payload": {
+                "type": "custom_tool_call_output", "call_id": "multi", "output": "Script completed"
+            }}),
+        ].map(|record| record.to_string()).join("\n");
+        let (_, events) = decode(&transcript);
+        let calls: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                EventKind::ToolStarted(tool) => Some((
+                    tool.id.as_str(),
+                    tool.name.as_str(),
+                    tool.summary.as_deref(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            [(
+                "multi",
+                "exec",
+                Some(
+                    "apply_patch: src/main.rs; exec_command: cargo test --lib; view_image: output.png"
+                )
+            )]
+        );
+        let finishes: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                EventKind::ToolFinished(tool) => Some((tool.id.as_str(), tool.outcome)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(finishes, [("multi", ToolOutcome::Succeeded)]);
     }
 
     #[test]

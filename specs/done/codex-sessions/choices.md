@@ -29,15 +29,6 @@
 - **Verdict:** needs-user — the conservative state is required, while this exact presentation is a reversible product choice.
 - **Confidence:** medium.
 
-### Compact tool summaries use a small, ordered field vocabulary
-
-- **When:** Slice 01 (`codex-slice1`).
-- **The choice:** When a tool starts, the decoder keeps the call id and tool name exactly, then chooses the first useful string from `task_name`, `description`, `command`, `file_path`, `path`, or `query` as a short display summary. It flattens whitespace and limits the summary to 200 characters. For example, a spawn call with `task_name: "index-tests"` becomes a tool event labelled `index-tests`; an unfamiliar tool whose useful argument is under another key still has a correct id/name but no summary. The unbuilt alternative is to retain every argument as generic JSON and make a later UI layer decide what is safe and useful to show.
-- **The gap:** The plan requires normalized tool starts and spawn labels, but does not specify the provider-neutral argument representation or summary policy.
-- **The reach:** Later model and UI work may treat `ToolStart.summary` as the adapter's final display-ready description, so this establishes where argument summarization lives and which fields are visible.
-- **Verdict:** needs-user — this is a presentation/product choice rather than a correctness requirement. The recommended provisional call is to keep the compact adapter-owned summary because it avoids exposing a provider wire object throughout the core; reversing it only requires replacing the optional summary field before Slice 03 removes the old path.
-- **Confidence:** medium.
-
 ### Equal-mtime automatic discovery prefers Codex, then the greater path
 
 - **When:** Slice 02 (`codex-slice2`).
@@ -46,6 +37,16 @@
 - **The reach:** This affects only automatic cwd discovery at exact timestamp ties, which can occur with copied fixtures or coarse filesystems. It does not change family eligibility, explicit-file pinning, or normal newest-session behavior.
 - **Verdict:** needs-user — the ordering is a product default rather than a correctness fact. The recommended provisional call is to keep it: it is stable, reversible, and gives the newly supported provider a predictable result without adding a prompt to a read-only launcher.
 - **Confidence:** medium.
+
+## User-confirmed
+
+### Compact tool summaries align with Claude readability
+
+- **The choice:** Keep display-ready summaries in the provider adapter and share compact formatting and cwd-relative paths with Claude. The [summary policy](../../../src/formats/summary.rs) owns input extraction and display limits.
+- **The gap:** Codex code-mode records JavaScript, not just JSON arguments. A JSON-only summary hides the operation behind the wrapper name.
+- **The reach:** Static call-site summaries make the wrapper readable without inventing extra tool calls, changing status, or executing transcript code. Dynamic arguments retain source snippets instead of inferred values. Full input/output expansion is a separate feature.
+- **Verdict:** accepted — the user explicitly requested alignment with Claude's existing readable summaries.
+- **Confidence:** high.
 
 ## Sound
 

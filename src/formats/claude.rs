@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 
+use super::summary::{short_path, truncate_summary};
 use crate::event::{
     ActorId, AgentCompletionPolicy, AgentDescriptor, AgentMetadataPatch, AgentRole,
     AssistantChannel, EventKind, EventTime, Provider, RecordedAgentStatus, SessionEvent,
@@ -536,33 +537,6 @@ fn summarize_tool(name: &str, input: &serde_json::Value, cwd: Option<&str>) -> O
         "WebFetch" => pick("url"),
         "ToolSearch" => pick("query"),
         _ => pick("description").or_else(|| pick("query")),
-    }
-}
-
-fn truncate_summary(text: &str) -> String {
-    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() > 200 {
-        format!("{}…", flat.chars().take(199).collect::<String>())
-    } else {
-        flat
-    }
-}
-
-fn short_path(path: &str, cwd: Option<&str>) -> String {
-    let relative = cwd
-        .and_then(|cwd| path.strip_prefix(cwd).map(|rest| (cwd, rest)))
-        .filter(|(cwd, rest)| rest.starts_with('/') || cwd.ends_with('/'))
-        .map(|(_, rest)| rest.trim_start_matches('/'))
-        .filter(|rest| !rest.is_empty())
-        .unwrap_or(path);
-    let count = relative.chars().count();
-    if count <= 200 {
-        relative.to_owned()
-    } else {
-        format!(
-            "…{}",
-            relative.chars().skip(count - 199).collect::<String>()
-        )
     }
 }
 

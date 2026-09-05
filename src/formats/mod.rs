@@ -5,6 +5,7 @@
 
 pub mod claude;
 pub mod codex;
+mod summary;
 
 use crate::event::{Provider, SessionEvent, SessionKey, SessionMetadata};
 use claude::{ClaudeDecoder, ClaudeFile};

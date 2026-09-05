@@ -90,11 +90,11 @@ also makes equal-or-longer atomic replacement detectable during live follow.
 
 ## Decisions that remain product choices
 
-The [choices ledger](choices.md) preserves five reversible defaults that need
-owner buy-in: the browser workspace's separate Rust floor, equal-time scrubber
-binning, the presentation of uncertain tool results, the compact tool-summary
-field vocabulary, and the deterministic winner for an exact cross-provider
-mtime tie. None weakens the correctness or privacy invariants above.
+The [choices ledger](choices.md) preserves the remaining reversible defaults
+that need owner buy-in: the browser workspace's separate Rust floor, equal-time
+scrubber binning, the presentation of uncertain tool results, and the
+deterministic winner for an exact cross-provider mtime tie. None weakens the
+correctness or privacy invariants above.
 
 ## Material divergences from the build plan
 
