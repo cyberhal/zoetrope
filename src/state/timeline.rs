@@ -1138,6 +1138,7 @@ mod tests {
                     tool_call_id: None,
                     time: EventTime::AtAgentStart(ActorId::from(agent)),
                     preceding_context: None,
+                    task_description: None,
                 },
                 spawn_reference: None,
                 completion_policy: crate::event::AgentCompletionPolicy::InferFromSilence,

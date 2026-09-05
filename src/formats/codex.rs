@@ -11,12 +11,12 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::summary::codex_tool_summary;
+use super::summary::{codex_tool_summary, task_description};
 use crate::event::{
     ActorId, AgentCompletionPolicy, AgentDescriptor, AgentRole, AssistantChannel, EventKind,
-    EventTime, Provider, RecordedAgentStatus, SessionEvent, SessionKey, SessionMetadata,
-    SessionOrigin, SpawnProvenance, ToolCategory, ToolFinish, ToolOutcome, ToolStart,
-    UsageObservation,
+    EventTime, Provider, RecordedAgentStatus, SessionEvent, SessionInfoPatch, SessionKey,
+    SessionMetadata, SessionOrigin, SpawnProvenance, ToolCategory, ToolFinish, ToolOutcome,
+    ToolStart, UsageObservation,
 };
 
 /// A non-fatal condition that cannot be represented as session activity.
@@ -139,11 +139,17 @@ impl CodexDecoder {
             origin,
         };
         self.session = Some(metadata.clone());
-        vec![SessionEvent {
+        let info = self.info(SessionInfoPatch {
+            cwd: metadata.cwd.clone(),
+            ..SessionInfoPatch::default()
+        });
+        let mut events = vec![SessionEvent {
             actor: ActorId(payload.id),
             time: event_time(timestamp),
             kind: EventKind::SessionMetadata(metadata),
-        }]
+        }];
+        events.extend(info);
+        events
     }
 
     fn decode_turn_context(
@@ -151,22 +157,33 @@ impl CodexDecoder {
         timestamp: Option<DateTime<Utc>>,
         payload: TurnContextPayload,
     ) -> Vec<SessionEvent> {
+        let mut events: Vec<_> = self
+            .info(SessionInfoPatch {
+                cwd: payload.cwd,
+                approval_policy: recorded_label(&payload.approval_policy, "type"),
+                sandbox_policy: recorded_label(&payload.sandbox_policy, "type"),
+                permission_profile: recorded_label(&payload.active_permission_profile, "id"),
+                mode: recorded_label(&payload.collaboration_mode, "mode"),
+                effort: recorded_label(&payload.effort, "effort"),
+                ..SessionInfoPatch::default()
+            })
+            .into_iter()
+            .collect();
         if let Some(turn_id) = payload.turn_id.filter(|id| !id.trim().is_empty()) {
             self.current_turn = Some(turn_id);
         }
         let Some(model) = payload.model.filter(|model| !model.trim().is_empty()) else {
-            return Vec::new();
+            return events;
         };
         let key = self
             .current_turn
             .clone()
             .unwrap_or_else(|| format!("untimed:{model}"));
         if !self.seen_model_turns.insert(key) {
-            return Vec::new();
+            return events;
         }
-        self.event(timestamp, EventKind::ModelSelected { model })
-            .into_iter()
-            .collect()
+        events.extend(self.event(timestamp, EventKind::ModelSelected { model }));
+        events
     }
 
     fn decode_response_item(
@@ -335,9 +352,21 @@ impl CodexDecoder {
         if !self.seen_prompts.insert(key) {
             return Vec::new();
         }
+        let info = self.info(SessionInfoPatch {
+            last_prompt: Some(text.clone()),
+            ..SessionInfoPatch::default()
+        });
         self.event(timestamp, EventKind::Prompt { text })
             .into_iter()
+            .chain(info)
             .collect()
+    }
+
+    fn info(&self, patch: SessionInfoPatch) -> Option<SessionEvent> {
+        if patch == SessionInfoPatch::default() {
+            return None;
+        }
+        self.event(None, EventKind::SessionInfo(patch))
     }
 
     fn tool_started(
@@ -376,6 +405,9 @@ impl CodexDecoder {
                     tool_call_id: Some(id.clone()),
                     time: event_time(timestamp),
                     preceding_context: self.latest_context_text.clone(),
+                    task_description: input
+                        .and_then(|input| serde_json::from_str(input).ok())
+                        .and_then(|input| task_description(&input)),
                 },
             );
         }
@@ -471,6 +503,7 @@ impl CodexDecoder {
                         tool_call_id: activity.event_id.clone(),
                         time: EventTime::Untimed,
                         preceding_context: None,
+                        task_description: None,
                     });
                 self.event(
                     timestamp,
@@ -595,6 +628,11 @@ fn goal_objective(text: &str) -> Option<String> {
     let (objective, _) = after_open.split_once("</objective>")?;
     let objective = objective.trim();
     (!objective.is_empty()).then(|| objective.to_owned())
+}
+
+fn recorded_label(value: &Value, key: &str) -> Option<String> {
+    let text = value.as_str().or_else(|| value.get(key)?.as_str())?.trim();
+    (!text.is_empty()).then(|| text.to_owned())
 }
 
 fn path_label(path: &str) -> Option<String> {
@@ -773,6 +811,18 @@ struct TurnContextPayload {
     turn_id: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    approval_policy: Value,
+    #[serde(default)]
+    sandbox_policy: Value,
+    #[serde(default)]
+    active_permission_profile: Value,
+    #[serde(default)]
+    collaboration_mode: Value,
+    #[serde(default)]
+    effort: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1353,7 +1403,10 @@ mod tests {
             semantic_sequence(&events),
             [
                 "session root-thread",
+                "session-info",
                 "prompt Map the dependency graph.",
+                "session-info",
+                "session-info",
                 "model gpt-test",
                 "assistant Commentary I will inspect the graph.",
                 "reasoning The graph has one risky seam.",
@@ -1437,8 +1490,12 @@ mod tests {
         let (mut decoder, events) = decode(include_str!(
             "../../tests/fixtures/codex/child-without-marker.jsonl"
         ));
-        assert_eq!(events.len(), 1);
-        assert!(matches!(events[0].kind, EventKind::SessionMetadata(_)));
+        assert!(events.iter().all(|event| matches!(
+            event.kind,
+            EventKind::SessionMetadata(_) | EventKind::SessionInfo(_)
+        )));
+        assert!(events.iter().any(|event| matches!(&event.kind,
+            EventKind::SessionInfo(info) if info.cwd.as_deref() == Some("/workspace/demo"))));
         assert_eq!(
             decoder.finish(),
             [DecoderDiagnostic::MissingOwnedTurnMarker]

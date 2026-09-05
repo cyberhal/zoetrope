@@ -160,9 +160,16 @@ async fn run_inspect(file: PathBuf) -> Result<()> {
         "  {} agent(s), {} tool call(s) · {} queued · {} file edit(s)",
         model.agent_count(),
         model.tool_count(),
-        info.queued_ops,
-        info.file_snapshots,
+        info.queued_ops
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "—".to_owned()),
+        info.file_snapshots
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "—".to_owned()),
     );
+    for (label, value) in info.execution_details() {
+        println!("  {label}: {value}");
+    }
     if let Some(p) = &info.last_prompt {
         println!("  last prompt: {p:?}");
     }
@@ -197,7 +204,7 @@ fn print_agent_tree(model: &SessionModel, parent: Option<&str>, depth: usize) {
         let label = agent
             .agent_type
             .as_deref()
-            .or(agent.description.as_deref())
+            .or(model.agent_description(agent))
             .unwrap_or(id);
 
         // Tool tallies.
@@ -215,7 +222,7 @@ fn print_agent_tree(model: &SessionModel, parent: Option<&str>, depth: usize) {
         }
 
         println!("{indent}{glyph} [{kind}] {label}  ({status}) — id={id}");
-        if let Some(desc) = &agent.description
+        if let Some(desc) = model.agent_description(agent)
             && agent.agent_type.is_some()
         {
             println!("{indent}    {desc}");

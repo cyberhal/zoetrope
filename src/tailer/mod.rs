@@ -74,7 +74,7 @@ pub enum UiEvent {
         session: SessionKey,
         items: Vec<ReplayItem>,
         speed: f64,
-        info: crate::state::SessionInfo,
+        info: Box<crate::state::SessionInfo>,
     },
     /// Adopt the decoder-confirmed identity and reset the model. Sent both for
     /// truncation/rotation and before a newly loaded snapshot.

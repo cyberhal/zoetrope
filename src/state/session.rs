@@ -139,6 +139,7 @@ pub struct SpawnContext {
     pub ts: Option<DateTime<Utc>>,
     /// Excerpt of the assistant's reasoning right before the spawn.
     pub reasoning: Option<String>,
+    pub task_description: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -333,9 +334,9 @@ impl AgentInfo {
         status_word(self.status, self.interactive)
     }
 
-    /// Most recent tool call name, if any.
-    pub fn last_tool(&self) -> Option<&str> {
-        self.tool_calls.last().map(|t| t.name.as_str())
+    /// Most recent tool invocation, including its display summary.
+    pub fn last_tool(&self) -> Option<&ToolCallInfo> {
+        self.tool_calls.last()
     }
 
     fn touch_ts(&mut self, ts: Option<DateTime<Utc>>) {
@@ -572,6 +573,7 @@ impl SessionModel {
                 SpawnContext {
                     ts: timestamp(&spawn.time).or(ts),
                     reasoning: spawn.preceding_context.clone(),
+                    task_description: spawn.task_description.clone(),
                 },
                 2,
             );
@@ -674,6 +676,7 @@ impl SessionModel {
                 SpawnContext {
                     ts: timestamp(&descriptor.spawn.time),
                     reasoning: descriptor.spawn.preceding_context.clone(),
+                    task_description: descriptor.spawn.task_description.clone(),
                 },
                 1,
             );
@@ -791,6 +794,7 @@ impl SessionModel {
                     SpawnContext {
                         ts: timestamp(&spawn.time),
                         reasoning: spawn.preceding_context.clone(),
+                        task_description: spawn.task_description.clone(),
                     },
                     0,
                 );
@@ -845,6 +849,9 @@ impl SessionModel {
                     candidate.reasoning = candidate
                         .reasoning
                         .or_else(|| known.context.reasoning.clone());
+                    candidate.task_description = candidate
+                        .task_description
+                        .or_else(|| known.context.task_description.clone());
                     *known = SpawnEvidence {
                         context: candidate,
                         strength,
@@ -853,6 +860,11 @@ impl SessionModel {
                     known.context.ts = known.context.ts.or(candidate.ts);
                     known.context.reasoning =
                         known.context.reasoning.take().or(candidate.reasoning);
+                    known.context.task_description = known
+                        .context
+                        .task_description
+                        .take()
+                        .or(candidate.task_description);
                 } else if strength == known.strength {
                     // Equal-strength mirrors merge deterministically rather
                     // than making filesystem delivery order observable.
@@ -865,6 +877,13 @@ impl SessionModel {
                             (Some(left), Some(right)) => Some(left.min(right)),
                             (known, candidate) => known.or(candidate),
                         };
+                    known.context.task_description = match (
+                        known.context.task_description.take(),
+                        candidate.task_description,
+                    ) {
+                        (Some(left), Some(right)) => Some(left.min(right)),
+                        (known, candidate) => known.or(candidate),
+                    };
                 }
             }
         }
@@ -1089,6 +1108,16 @@ impl SessionModel {
         self.agents.get(id)
     }
 
+    /// Explicit agent metadata wins; a task attached to its exact spawning call
+    /// fills the gap regardless of parent/child file delivery order.
+    pub fn agent_description<'a>(&'a self, agent: &'a AgentInfo) -> Option<&'a str> {
+        agent
+            .description
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .or_else(|| self.provenance(agent)?.task_description.as_deref())
+    }
+
     /// Why `agent` exists, if its spawning call was observed: the triggering
     /// user prompt and the assistant reasoning before the spawn.
     pub fn provenance(&self, agent: &AgentInfo) -> Option<&SpawnContext> {
@@ -1138,9 +1167,9 @@ impl SessionModel {
             // A subagent's spawn = its birth: mark it when the agent starts to
             // exist (`first_ts`), where the node appears and the strip's meta ❋ sits.
             if matches!(agent.kind, AgentKind::Subagent) {
-                let text = agent
-                    .description
-                    .clone()
+                let text = self
+                    .agent_description(agent)
+                    .map(str::to_owned)
                     .or_else(|| agent.agent_type.clone())
                     .unwrap_or_else(|| "subagent".to_string());
                 consider(agent.first_ts, LogKind::Spawn, text);
@@ -1259,6 +1288,31 @@ mod tests {
     use crate::formats::claude::ClaudeFile;
     use crate::transcript::{Entry, SubagentMeta, parse_line};
 
+    #[test]
+    fn assigned_tasks_follow_spawn_links_in_either_event_order() {
+        let decoded = crate::tailer::replay_from_jsonl(
+            include_str!("../../tests/fixtures/codex/readability.jsonl"),
+            "unused",
+        );
+        for reverse in [false, true] {
+            let mut model = SessionModel::new(decoded.session.clone());
+            let mut events: Vec<_> = decoded.items.iter().map(|item| &item.event).collect();
+            if reverse {
+                events.reverse();
+            }
+            for event in events {
+                model.apply_event(event);
+            }
+            assert_eq!(
+                model.agent_description(model.agent("parser").unwrap()),
+                Some("Review event ordering and ownership")
+            );
+            assert_eq!(
+                model.agent_description(model.agent("display").unwrap()),
+                Some("Check readable labels and metadata")
+            );
+        }
+    }
     /// Build an `Entry` from a JSONL line, panicking in tests only if the
     /// fixture itself is malformed (parser returns `None`).
     fn entry(line: &str) -> Entry {
@@ -1403,6 +1457,7 @@ mod tests {
                     tool_call_id: Some("spawn".into()),
                     time: EventTime::Untimed,
                     preceding_context: None,
+                    task_description: None,
                 },
                 spawn_reference: None,
                 completion_policy: AgentCompletionPolicy::ExplicitLifecycle,
@@ -1534,6 +1589,7 @@ mod tests {
                 tool_call_id: Some(id.into()),
                 time: EventTime::Untimed,
                 preceding_context: Some(format!("context for {id}")),
+                task_description: None,
             }),
         }))
     }
@@ -1555,6 +1611,7 @@ mod tests {
                 tool_call_id: None,
                 time: EventTime::Untimed,
                 preceding_context: None,
+                task_description: None,
             },
             spawn_reference: Some(reference.into()),
             completion_policy: AgentCompletionPolicy::ExplicitLifecycle,
@@ -1688,6 +1745,7 @@ mod tests {
                     tool_call_id: Some("spawn".into()),
                     time: EventTime::At(call_time),
                     preceding_context: Some("inspect the risky seam".into()),
+                    task_description: None,
                 }),
             }),
         };

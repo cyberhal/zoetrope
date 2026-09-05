@@ -40,6 +40,19 @@
 
 ## User-confirmed
 
+### Readability extends to the overview, assigned task, and session information
+
+- **The choice:** Surface the adapter's summaries in the global graph as well as
+  the tool list, derive assigned tasks through spawn provenance, and expose the
+  selected root's recorded session settings.
+- **The gap:** Readable detail rows alone do not explain what each agent is doing
+  in the overview, and missing provider statistics must not look like zero.
+- **The reach:** Both providers share the presentation and ownership rules in
+  [the architecture](../../../docs/ARCHITECTURE.md#fold-competing-facts-by-evidence).
+  This does not change tool outcome inference or browser family discovery.
+- **Verdict:** accepted — the user selected these three gaps for the next pass.
+- **Confidence:** high.
+
 ### Compact tool summaries align with Claude readability
 
 - **The choice:** Keep display-ready summaries in the provider adapter and share compact formatting and cwd-relative paths with Claude. The [summary policy](../../../src/formats/summary.rs) owns input extraction and display limits.

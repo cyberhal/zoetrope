@@ -105,23 +105,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 /// queued/file-edit counts.
 fn render_info(frame: &mut Frame, area: Rect, app: &App) {
     let palette = app.flow.theme.palette();
-    let w = area.width.min(54);
-    let h = area.height.min(11);
-    if w < 24 || h < 7 {
+    let w = area.width.min(72);
+    if w < 24 || area.height < 7 {
         return;
     }
-    let popup = Rect::new(
-        area.x + (area.width - w) / 2,
-        area.y + (area.height - h) / 2,
-        w,
-        h,
-    );
-    frame.render_widget(Clear, popup);
 
     let bg = Style::default().bg(palette.surface);
     let key = bg.fg(palette.accent).add_modifier(Modifier::BOLD);
     let txt = bg.fg(palette.text);
-    let dim = bg.fg(palette.subtle);
     let info = &app.session_info;
 
     let value_w = (w as usize).saturating_sub(12);
@@ -133,27 +124,45 @@ fn render_info(frame: &mut Frame, area: Rect, app: &App) {
     };
     let dash = "—".to_string();
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(""),
         row(
             "title",
             info.title.clone().unwrap_or_else(|| dash.clone()),
             txt,
         ),
-        row(
+    ];
+    if let Some(cwd) = &info.cwd {
+        lines.push(row("cwd", cwd.clone(), txt));
+    }
+    if info.permission_mode.is_some() || info.approval_policy.is_none() {
+        lines.push(row(
             "perms",
             info.permission_mode.clone().unwrap_or_else(|| dash.clone()),
             txt,
-        ),
-        row(
-            "mode",
-            info.mode.clone().unwrap_or_else(|| dash.clone()),
-            txt,
-        ),
+        ));
+    }
+    lines.push(row(
+        "mode",
+        info.mode.clone().unwrap_or_else(|| dash.clone()),
+        txt,
+    ));
+    for (label, value) in info.execution_details() {
+        lines.push(row(label, value.to_owned(), txt));
+    }
+    lines.extend([
         row(
             "queued",
-            format!("{} · {} file edits", info.queued_ops, info.file_snapshots),
-            dim,
+            format!(
+                "{} · {} file edits",
+                info.queued_ops
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| dash.clone()),
+                info.file_snapshots
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| dash.clone())
+            ),
+            txt,
         ),
         row(
             "last",
@@ -161,9 +170,18 @@ fn render_info(frame: &mut Frame, area: Rect, app: &App) {
                 .as_deref()
                 .map(|p| format!("\"{p}\""))
                 .unwrap_or_else(|| dash.clone()),
-            dim,
+            txt,
         ),
-    ];
+    ]);
+
+    let h = area.height.min((lines.len() + 3) as u16);
+    let popup = Rect::new(
+        area.x + (area.width - w) / 2,
+        area.y + (area.height - h) / 2,
+        w,
+        h,
+    );
+    frame.render_widget(Clear, popup);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -174,7 +192,7 @@ fn render_info(frame: &mut Frame, area: Rect, app: &App) {
                 .centered()
                 .style(bg.fg(palette.text).add_modifier(Modifier::BOLD)),
         )
-        .title_bottom(Line::from(" i / esc to close ").centered().style(dim));
+        .title_bottom(Line::from(" i / esc to close ").centered().style(txt));
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
@@ -933,6 +951,104 @@ mod tests {
     use crate::event::{Provider, SessionKey};
     use crate::formats::claude::{ClaudeDecoder, ClaudeFile};
     use crate::tailer::ReplayItem;
+
+    #[test]
+    fn codex_overview_shows_the_operation_summary() {
+        let transcript = [
+            serde_json::json!({"timestamp": "2026-09-01T10:00:00Z", "type": "session_meta", "payload": {
+                "id": "overview", "cwd": "/project", "source": "cli"
+            }}),
+            serde_json::json!({"timestamp": "2026-09-01T10:00:01Z", "type": "response_item", "payload": {
+                "type": "custom_tool_call", "call_id": "command", "name": "exec",
+                "input": "text(await tools.exec_command({cmd: 'cargo test'}));"
+            }}),
+        ].map(|record| record.to_string()).join("\n");
+        let mut app = crate::test_support::app_from_jsonl(&transcript);
+        let buffer = crate::test_support::render_app(&mut app, 120, 35);
+        let rendered =
+            crate::test_support::node_text(&app, &buffer, crate::state::session::MAIN_ID);
+        assert!(rendered.contains("exec_command: cargo test"), "{rendered}");
+    }
+
+    #[test]
+    fn codex_agent_task_is_visible_in_the_graph_and_detail_panel() {
+        let transcript = [
+            serde_json::json!({"timestamp":"2026-09-01T10:00:00Z","type":"session_meta","payload":{"id":"tasks","source":"cli"}}),
+            serde_json::json!({"timestamp":"2026-09-01T10:00:01Z","type":"response_item","payload":{
+                "type":"function_call","call_id":"spawn","name":"spawn_agent",
+                "arguments": serde_json::json!({"task_name":"parser","message":"Review the parser for errors"}).to_string()
+            }}),
+            serde_json::json!({"timestamp":"2026-09-01T10:00:02Z","type":"event_msg","payload":{
+                "type":"sub_agent_activity","event_id":"spawn","kind":"started","agent_thread_id":"child","agent_path":"/root/parser"
+            }}),
+        ].map(|record| record.to_string()).join("\n");
+        let mut app = crate::test_support::app_from_jsonl(&transcript);
+        let graph = crate::test_support::render_app(&mut app, 160, 45);
+        let text = crate::test_support::node_text(&app, &graph, "child");
+        assert!(text.contains("Review the parser for errors"), "{text}");
+        // Render the actual panel in isolation so the graph cannot satisfy
+        // this assertion if the panel loses its task description.
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| super::panel::render(frame, frame.area(), &mut app, "child"))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Review the parser for errors"), "{text}");
+    }
+
+    #[test]
+    fn codex_session_info_shows_recorded_policy_and_unknown_counters() {
+        let transcript = [
+            serde_json::json!({"type":"session_meta","payload":{"id":"info","source":"cli","cwd":"/project"}}),
+            serde_json::json!({"type":"turn_context","payload":{
+                "turn_id":"turn", "model":"gpt-test", "approval_policy":"on-request",
+                "sandbox_policy":{"type":"workspace-write"},
+                "collaboration_mode":{"mode":"plan"}, "effort":"high"
+            }}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"Review the import path"}}),
+        ].map(|record| record.to_string()).join("\n");
+        let mut app = crate::test_support::app_from_jsonl(&transcript);
+        app.show_info = true;
+        let buffer = crate::test_support::render_app(&mut app, 120, 35);
+        let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        for expected in [
+            "/project",
+            "on-request",
+            "workspace-write",
+            "plan",
+            "high",
+            "Review the import path",
+            "— · — file edits",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        assert!(!text.contains("0 file edits"), "{text}");
+    }
+
+    #[test]
+    fn session_reset_clears_the_previous_roots_execution_settings() {
+        let transcript = [
+            serde_json::json!({"type":"session_meta","payload":{"id":"previous","source":"cli","cwd":"/previous"}}),
+            serde_json::json!({"type":"turn_context","payload":{"approval_policy":"on-request","collaboration_mode":{"mode":"plan"}}}),
+        ].map(|record| record.to_string()).join("\n");
+        let mut app = crate::test_support::app_from_jsonl(&transcript);
+        app.handle_ui_event(crate::tailer::UiEvent::SessionReset {
+            session: SessionKey::new(Provider::Codex, "replacement"),
+        });
+        app.show_info = true;
+        let buffer = crate::test_support::render_app(&mut app, 120, 35);
+        let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(!text.contains("on-request"), "{text}");
+        assert!(!text.contains("/previous"), "{text}");
+        assert!(text.contains("— · — file edits"), "{text}");
+    }
 
     #[test]
     fn truncate_basic() {

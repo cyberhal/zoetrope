@@ -156,7 +156,13 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App, agent_id: &str) {
     ])
     .areas(inner);
 
-    render_header(frame, header_area, agent, &palette);
+    render_header(
+        frame,
+        header_area,
+        agent,
+        session.agent_description(agent),
+        &palette,
+    );
     if provenance.is_some() {
         render_provenance(frame, prov_area, &prov_prompt, &prov_thought, &palette);
     }
@@ -176,7 +182,13 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App, agent_id: &str) {
     );
 }
 
-fn render_header(frame: &mut Frame, area: Rect, agent: &AgentInfo, palette: &rataflow::Palette) {
+fn render_header(
+    frame: &mut Frame,
+    area: Rect,
+    agent: &AgentInfo,
+    description: Option<&str>,
+    palette: &rataflow::Palette,
+) {
     // Single-source vocabulary + presence colors (shared with cards/inspect).
     let status_text = agent.status_word();
     let status_color = crate::ui::status_color(agent.status, palette);
@@ -216,11 +228,8 @@ fn render_header(frame: &mut Frame, area: Rect, agent: &AgentInfo, palette: &rat
     )));
 
     // Description (wrapped) on the remaining rows.
-    if let Some(desc) = agent.description.as_ref().filter(|d| !d.is_empty()) {
-        lines.push(Line::from(Span::styled(
-            desc.as_str(),
-            bg.fg(palette.subtle),
-        )));
+    if let Some(desc) = description {
+        lines.push(Line::from(Span::styled(desc, bg.fg(palette.text))));
     }
 
     frame.render_widget(

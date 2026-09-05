@@ -70,29 +70,31 @@ fn node_dims(kind: AgentKind) -> (f64, f64) {
 /// Whether a node's content already mirrors the agent — allocation-free
 /// comparison so unchanged agents skip [`build_content`]'s String clones on
 /// every sync (the steady state for almost all agents on almost all ticks).
-fn content_matches(info: &AgentInfo, node: &AgentNode) -> bool {
+fn content_matches(model: &SessionModel, info: &AgentInfo, node: &AgentNode) -> bool {
     let title_ok = match info.kind {
         AgentKind::Main => node.title == info.agent_type.as_deref().unwrap_or("session"),
         AgentKind::WorkflowGroup => node.title == info.agent_type.as_deref().unwrap_or("workflow"),
         AgentKind::Subagent => node.title == info.agent_type.as_deref().unwrap_or("subagent"),
     };
     title_ok
-        && node.description.as_deref() == info.description.as_deref()
+        && node.description.as_deref() == model.agent_description(info)
         && node.status == info.status
         && node.tool_count == info.tool_calls.len()
-        && node.last_tool.as_deref() == info.last_tool()
+        && node.last_tool.as_deref() == info.last_tool().map(|tool| tool.name.as_str())
+        && node.tool_summary.as_deref() == info.last_tool().and_then(|tool| tool.summary.as_deref())
         && node.output_tokens == info.output_tokens
         && node.interactive == info.is_interactive()
 }
 
 /// Build the [`AgentNode`] content mirrored from an [`AgentInfo`].
-fn build_content(info: &AgentInfo) -> AgentNode {
+fn build_content(model: &SessionModel, info: &AgentInfo) -> AgentNode {
     AgentNode {
         title: node_title(info),
-        description: info.description.clone(),
+        description: model.agent_description(info).map(str::to_owned),
         status: info.status,
         tool_count: info.tool_calls.len(),
-        last_tool: info.last_tool().map(str::to_string),
+        last_tool: info.last_tool().map(|tool| tool.name.clone()),
+        tool_summary: info.last_tool().and_then(|tool| tool.summary.clone()),
         output_tokens: info.output_tokens,
         interactive: info.is_interactive(),
     }
@@ -127,8 +129,8 @@ pub fn sync(flow: &mut AgentFlow, model: &SessionModel, relayout: bool) -> bool 
             // Steady state: only rebuild (String clones) when something
             // visible changed — the per-second status tick and per-batch
             // syncs walk every agent, and most are unchanged.
-            if !content_matches(info, existing) {
-                *existing = build_content(info);
+            if !content_matches(model, info, existing) {
+                *existing = build_content(model, info);
             }
         } else {
             // Sibling index for local placement — computed only for the rare
@@ -145,7 +147,7 @@ pub fn sync(flow: &mut AgentFlow, model: &SessionModel, relayout: bool) -> bool 
                         .count()
                 })
                 .unwrap_or(0);
-            let content = build_content(info);
+            let content = build_content(model, info);
             let (w, h) = node_dims(info.kind);
             // Local placement: below the parent, fanned past prior siblings.
             // Overwritten by Sugiyama when `relayout` runs; kept verbatim in

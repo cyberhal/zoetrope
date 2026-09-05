@@ -132,7 +132,7 @@ fn main() -> io::Result<()> {
         session: decoded.session,
         items: decoded.items,
         speed: DEMO_SPEED,
-        info: decoded.info,
+        info: Box::new(decoded.info),
     });
     FEED.with(|cell| *cell.borrow_mut() = Some(decoded.feed));
 
@@ -297,7 +297,7 @@ pub fn zoetrope_load(
         session: decoded.session,
         items: decoded.items,
         speed: DEMO_SPEED,
-        info: decoded.info,
+        info: Box::new(decoded.info),
     });
     FEED.with(|cell| *cell.borrow_mut() = Some(decoded.feed));
 

@@ -3,6 +3,15 @@
 
 use serde_json::Value;
 
+pub(super) fn task_description(input: &Value) -> Option<String> {
+    ["description", "message", "prompt"]
+        .into_iter()
+        .find_map(|key| {
+            let text = input.get(key)?.as_str()?.trim();
+            (!text.is_empty()).then(|| text.to_owned())
+        })
+}
+
 pub(super) fn truncate_summary(text: &str) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate_text(&flat, 200)

@@ -16,9 +16,9 @@ use ratatui::widgets::{Block, Borders, Padding, Paragraph, Widget};
 use crate::state::session::AgentStatus;
 
 /// Fixed card dimensions for main / workflow nodes (world units).
-pub const MAIN_NODE_DIMS: (f64, f64) = (30.0, 7.0);
+pub const MAIN_NODE_DIMS: (f64, f64) = (30.0, 8.0);
 /// Fixed card dimensions for subagent nodes (world units).
-pub const SUB_NODE_DIMS: (f64, f64) = (26.0, 6.0);
+pub const SUB_NODE_DIMS: (f64, f64) = (26.0, 7.0);
 
 /// Below this on-screen size a card has no room for any text — it renders at
 /// cell level instead (solid status-colored fill). Semantic zoom: zoomed out,
@@ -42,6 +42,8 @@ pub struct AgentNode {
     pub tool_count: usize,
     /// Name of the most recent tool call, if any.
     pub last_tool: Option<String>,
+    /// Operation detail from the same invocation as `last_tool`.
+    pub tool_summary: Option<String>,
     pub output_tokens: u64,
     /// Interactive agents (main, forks) word `Running` as "active": we know
     /// there are recent entries, not that a task is executing.
@@ -142,7 +144,7 @@ impl NodeContent for AgentNode {
 
         if let Some(desc) = self.description.as_ref().filter(|d| !d.is_empty()) {
             let desc = truncate(desc, inner_w);
-            lines.push(Line::from(Span::styled(desc, bg_style.fg(palette.subtle))));
+            lines.push(Line::from(Span::styled(desc, bg_style.fg(palette.text))));
         }
 
         // Tools row: "⚒ N · last_tool".
@@ -158,6 +160,13 @@ impl NodeContent for AgentNode {
             tools_text,
             bg_style.fg(palette.accent),
         )));
+
+        if let Some(summary) = self.tool_summary.as_deref().filter(|s| !s.is_empty()) {
+            lines.push(Line::from(Span::styled(
+                truncate(summary, inner_w),
+                bg_style.fg(palette.text),
+            )));
+        }
 
         // Footer row: status word + token count, separated to the edges.
         let tokens = fmt_tokens(self.output_tokens);
@@ -242,6 +251,7 @@ mod tests {
             status: AgentStatus::Done,
             tool_count: 3,
             last_tool: Some("Bash".into()),
+            tool_summary: None,
             output_tokens: 1200,
             interactive: false,
         };

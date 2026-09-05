@@ -153,7 +153,7 @@ pub fn load_snapshot(manifest: &SessionManifest) -> Result<SessionSnapshot, Box<
             .filter(|metadata| accepted_sessions.contains(&metadata.child))
             .map(synthetic_event),
     );
-    let (items, info) = crate::tailer::item::finish(events);
+    let (items, info) = crate::tailer::item::finish(events, &manifest.root.key);
     Ok(SessionSnapshot {
         key: manifest.root.key.clone(),
         items,
@@ -467,6 +467,7 @@ pub(crate) fn synthetic_event(metadata: &SyntheticMetadataEvent) -> SessionEvent
                 tool_call_id: None,
                 time: EventTime::AtAgentStart(ActorId(metadata.child.id.clone())),
                 preceding_context: None,
+                task_description: None,
             },
             spawn_reference: metadata.agent_path.clone(),
             completion_policy: AgentCompletionPolicy::ExplicitLifecycle,

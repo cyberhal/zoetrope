@@ -160,6 +160,10 @@ pub struct SessionInfoPatch {
     pub cwd: Option<String>,
     pub mode: Option<String>,
     pub permission_mode: Option<String>,
+    pub approval_policy: Option<String>,
+    pub sandbox_policy: Option<String>,
+    pub permission_profile: Option<String>,
+    pub effort: Option<String>,
     pub title: Option<String>,
     pub last_prompt: Option<String>,
     pub queued_ops_delta: u32,
@@ -268,6 +272,8 @@ pub struct SpawnProvenance {
     pub time: EventTime,
     /// Nearest preceding assistant text or reasoning supplied by the adapter.
     pub preceding_context: Option<String>,
+    /// Task assigned at the spawning call, distinct from the parent's reasoning.
+    pub task_description: Option<String>,
 }
 
 /// Structural role of a discovered non-root actor.

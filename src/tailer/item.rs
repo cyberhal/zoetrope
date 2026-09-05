@@ -260,7 +260,7 @@ pub fn replay_from_session(
         events.extend(feed.decode_claude_files(files));
     }
     feed.observe_times(&events);
-    let (items, info) = finish(events);
+    let (items, info) = finish(events, &session);
     DecodedSession {
         session,
         items,
@@ -275,13 +275,15 @@ fn decode_lines(decoder: &mut FileDecoder, text: &str) -> Vec<SessionEvent> {
         .collect()
 }
 
-pub(crate) fn finish(events: Vec<SessionEvent>) -> (Vec<ReplayItem>, crate::state::SessionInfo) {
-    let mut info = crate::state::SessionInfo::default();
+pub(crate) fn finish(
+    events: Vec<SessionEvent>,
+    root: &SessionKey,
+) -> (Vec<ReplayItem>, crate::state::SessionInfo) {
+    let mut info = crate::state::SessionInfo::new(root.provider);
     let mut items = Vec::new();
     let mut inherited: HashMap<ActorId, DateTime<Utc>> = HashMap::new();
     for event in events {
-        if let EventKind::SessionInfo(patch) = &event.kind {
-            info.apply(patch);
+        if info.consume(&event, root) {
             continue;
         }
         let prior = inherited.get(&event.actor).copied();
@@ -723,6 +725,7 @@ mod tests {
                             tool_call_id: None,
                             time: EventTime::At(timestamp),
                             preceding_context: None,
+                            task_description: None,
                         },
                         spawn_reference: None,
                         completion_policy: crate::event::AgentCompletionPolicy::InferFromSilence,

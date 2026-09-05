@@ -61,6 +61,20 @@ outranks silence heuristics. An uncertain tool result stays uncertain; a spawn
 acknowledgement is completion evidence only when the adapter explicitly marks
 that semantic meaning.
 
+Readable labels do not replace tool identity. Cards, detail panels, and chips
+reuse the adapter's display summary; chips aggregate only matching operations,
+not unrelated commands sharing a wrapper. Assigned tasks are separate from the
+parent's reasoning. The model derives a missing agent description from its exact
+spawn link, so late parent/child arrival cannot attach a neighboring task.
+Explicit agent metadata remains authoritative.
+
+Session information describes the selected root, not the whole agent family.
+[`SessionInfo`](../src/state/info.rs) owns this boundary for snapshots and live
+batches: child metadata never overwrites root settings, but a child opened
+explicitly supplies its own settings. These are the latest recorded values,
+outside the activity timeline; switching roots clears them. An unsupported
+provider statistic is unknown rather than evidence of zero operations.
+
 ## Keep content time separate from presentation time
 
 Content time comes from session events and determines folding, liveness, tool

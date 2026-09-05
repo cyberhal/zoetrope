@@ -90,10 +90,11 @@ Sessions picker and live folder following remain Claude-only. See the
 **The graph**
 - A node per agent: the main session, its subagents, and workflow groups with their
   children nested underneath
-- Status, current tool, tool count and output tokens on every card
+- Status, assigned task, current tool summary, tool count and output tokens on
+  agent cards
 - Edges animate while an agent is working, and settle when it finishes
-- Tool calls surface as chips beneath their agent (`⚒ bash ×5`, or `⚒ bash 0.5s`
-  ticking during a single call), resolving to `✓` or `✗`
+- Tool calls surface as readable chips beneath their agent; repeated matching
+  operations share a count, while different commands remain distinct
 - A minimap showing where your viewport sits once the graph outgrows the screen
 
 **Time travel**
@@ -106,9 +107,10 @@ Sessions picker and live folder following remain Claude-only. See the
 - Optional gap compression, to skip dead air or keep faithful real-time pacing
 
 **Inspection**
-- Click any agent for its provenance: the prompt that spawned it, the reasoning
-  around it, its model, and every tool call it made with timings
-- Session info overlay: mode, permissions, queued ops, file edits, last prompt
+- Click any agent for its assigned task and provenance: the prompt that spawned
+  it, the reasoning around it, its model, and every tool call it made with timings
+- Session info (`i`) shows the selected root's recorded execution settings and
+  latest prompt; unavailable provider statistics remain unknown, not zero
 - `zoe inspect` prints the whole tree headlessly, so it runs anywhere without a TTY
 
 **Reading your sessions**

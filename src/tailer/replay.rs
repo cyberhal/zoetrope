@@ -64,7 +64,7 @@ pub(crate) async fn run_replay(
             session: session.clone(),
             items: snapshot.items,
             speed: if speed > 0.0 { speed } else { 1.0 },
-            info: snapshot.info,
+            info: Box::new(snapshot.info),
         })
         .await
         .is_err()

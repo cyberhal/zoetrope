@@ -59,10 +59,10 @@ fn ttl(state: ToolState) -> Duration {
     }
 }
 
-/// One ephemeral chip — a **run of consecutive same-name tool calls** for one
+/// One ephemeral chip — a **run of consecutive same-name, same-summary calls** for one
 /// agent, collapsed into a single overlay (`⚒ bash ×5`). Aggregation is what
-/// keeps a busy agent's chips from churning through the per-agent cap: a burst
-/// of 20 reads is one chip that counts up, not 20 that flash past. The run is a
+/// keeps repeated operations from churning through the per-agent cap without
+/// hiding distinct commands behind a wrapper name. The run is a
 /// contiguous index range `[start, start+count)` into the agent's `tool_calls`;
 /// aggregate state (pending/✓/✗) is derived from those calls at render time, so
 /// the chip flips in place, and the fade clock anchors to that flip.
@@ -111,7 +111,7 @@ fn group_state(
     }
 }
 
-/// Two consecutive same-name calls farther apart than this (in media time) are
+/// Two otherwise matching calls farther apart than this (in media time) are
 /// separate runs rather than one aggregate — this bounds run growth and gives
 /// per-burst grouping, so a read now and a read a minute later don't collapse
 /// into one ever-growing `read ×N`. Because the boundary is derived from the
@@ -120,12 +120,12 @@ fn group_state(
 /// without timestamps (unit fixtures) always merge.
 ///
 /// Deliberately equal to [`CHIP_TTL`]: once a run has been quiet long enough to
-/// fade out, the next same-name call is also beyond the gap, so it opens a fresh
+/// fade out, the next matching call is also beyond the gap, so it opens a fresh
 /// run instead of resurrecting the faded one.
 const RUN_GAP: chrono::Duration = chrono::Duration::milliseconds(2500);
 
-/// Whether two consecutive calls belong to the same run: same only if their
-/// timestamps are within [`RUN_GAP`]. A missing timestamp can't split (merge).
+/// The time bound for an otherwise matching run. A missing timestamp cannot
+/// split it; present timestamps must be within [`RUN_GAP`].
 fn within_gap(prev: Option<DateTime<Utc>>, next: Option<DateTime<Utc>>) -> bool {
     match (prev, next) {
         (Some(p), Some(n)) => (n - p).abs() <= RUN_GAP,
@@ -200,7 +200,7 @@ impl ChipTray {
         }
         // Snapshot the prior tray by run identity so the rebuild can carry
         // afterglows across it. We keep each run's (count, afterglow): the count
-        // detects a run that gained a member (a fresh call joined a same-name
+        // detects a run that gained a member (a fresh call joined a matching
         // burst) so it re-anchors bright instead of aging out mid-burst.
         let prior: HashMap<(String, usize), (usize, Option<Duration>)> = self
             .chips
@@ -216,13 +216,13 @@ impl ChipTray {
             let calls = &info.tool_calls;
             let mut i = 0;
             while i < calls.len() {
-                // One run: a maximal group of consecutive same-name calls within
-                // RUN_GAP of each other.
+                // A wrapper name alone does not identify the operation being shown.
                 let name = &calls[i].name;
                 let start = i;
                 i += 1;
                 while i < calls.len()
                     && calls[i].name == *name
+                    && calls[i].summary == calls[start].summary
                     && within_gap(calls[i - 1].ts, calls[i].ts)
                 {
                     i += 1;
@@ -376,16 +376,19 @@ pub fn render(
         // shows its count (`⚒ bash ×5`); a single tool shows its duration
         // (`⚒ bash 0.5s`), live-ticking against `now` while it's still pending.
         let body_style = chip_style(state, age, &palette);
-        let body = if chip.count > 1 {
-            format!("⚒ {} ×{}", chip.name, chip.count)
+        let tool = model
+            .agent(&chip.agent_id)
+            .and_then(|a| a.tool_calls.get(chip.start));
+        let label = tool
+            .and_then(|tool| tool.summary.as_deref())
+            .filter(|summary| !summary.is_empty())
+            .unwrap_or(&chip.name);
+        let suffix = if chip.count > 1 {
+            format!(" ×{}", chip.count)
         } else {
-            let dur = model
-                .agent(&chip.agent_id)
-                .and_then(|a| a.tool_calls.get(chip.start))
-                .and_then(|tc| tc.duration(now))
+            tool.and_then(|tc| tc.duration(now))
                 .map(|d| format!(" {}", fmt_dur(d)))
-                .unwrap_or_default();
-            format!("⚒ {}{}", chip.name, dur)
+                .unwrap_or_default()
         };
         let glyph: Option<(&str, Style)> = match state {
             ToolState::Pending => None,
@@ -396,14 +399,24 @@ pub fn render(
             )),
             ToolState::CompletedUnknown => Some((" ?", body_style.fg(palette.subtle))),
         };
-        let mut cells: Vec<(char, Style)> = body.chars().map(|c| (c, body_style)).collect();
+        let width = (right - left - 2).max(0) as u16;
+        let reserved = unicode_width::UnicodeWidthStr::width(suffix.as_str())
+            + unicode_width::UnicodeWidthStr::width("⚒ ")
+            + glyph.map_or(0, |(text, _)| unicode_width::UnicodeWidthStr::width(text));
+        let label = crate::ui::truncate(label, (width as usize).saturating_sub(reserved));
+        let mut spans = vec![ratatui::text::Span::styled(
+            format!("⚒ {label}{suffix}"),
+            body_style,
+        )];
         if let Some((g, gs)) = glyph {
-            cells.extend(g.chars().map(|c| (c, gs)));
+            spans.push(ratatui::text::Span::styled(g, gs));
         }
-        for (i, (ch, style)) in cells.into_iter().enumerate() {
+        let mut row = Buffer::empty(ratatui::layout::Rect::new(0, 0, width, 1));
+        let (written, _) = row.set_line(0, 0, &ratatui::text::Line::from(spans), width);
+        for i in 0..written {
             let x = left + 1 + i as i32;
             if flow.is_in_bounds(x, y) {
-                buf[(x as u16, y as u16)].set_char(ch).set_style(style);
+                buf[(x as u16, y as u16)] = row[(i, 0)].clone();
             }
         }
     }
@@ -438,6 +451,46 @@ mod tests {
     use super::*;
     use crate::state::session::SessionModel;
     use crate::transcript::SubagentMeta;
+
+    #[test]
+    fn code_mode_chips_show_and_group_operations_by_summary() {
+        let mut records = vec![serde_json::json!({
+            "timestamp": "2026-09-01T10:00:00Z", "type": "session_meta",
+            "payload": {"id": "chips", "source": "cli", "cwd": "/project"}
+        })];
+        for (id, input) in [
+            ("a", "await tools.exec_command({cmd: 'cargo test'});"),
+            ("b", "await tools.exec_command({cmd: 'cargo test'});"),
+            ("c", "await tools.view_image({path: '/project/out.png'});"),
+        ] {
+            records.push(serde_json::json!({
+                "timestamp": "2026-09-01T10:00:01Z", "type": "response_item",
+                "payload": {"type": "custom_tool_call", "call_id": id, "name": "exec", "input": input}
+            }));
+        }
+        let transcript = records
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut app = crate::test_support::app_from_jsonl(&transcript);
+        app.chips.reconcile(Duration::ZERO, true, &app.session);
+        let buffer = crate::test_support::render_app(&mut app, 120, 35);
+        let (_, _, _, bottom) = app
+            .flow
+            .node_terminal_rect(crate::state::session::MAIN_ID)
+            .unwrap();
+        let chips: String = buffer
+            .content
+            .chunks(120)
+            .skip(bottom as usize)
+            .take(3)
+            .flat_map(|row| row.iter().map(|cell| cell.symbol()))
+            .collect();
+        assert!(chips.contains("exec_command: cargo test ×2"), "{chips}");
+        assert!(chips.contains("view_image: out.png"), "{chips}");
+        assert!(!chips.contains("exec ×3"), "{chips}");
+    }
 
     fn apply_meta(model: &mut SessionModel, agent_id: &str, meta: &SubagentMeta) {
         let session = model.session.clone();

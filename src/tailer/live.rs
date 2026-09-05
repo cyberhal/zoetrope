@@ -117,7 +117,7 @@ pub(crate) async fn run_live(
             session: session.clone(),
             items: snapshot.items,
             speed: 1.0,
-            info: snapshot.info,
+            info: Box::new(snapshot.info),
         })
         .await
         .is_err()
@@ -384,7 +384,7 @@ async fn reload_current(live: &mut LiveSession, ui_tx: &mpsc::Sender<UiEvent>) -
             session,
             items: snapshot.items,
             speed: live.replay_speed,
-            info: snapshot.info,
+            info: Box::new(snapshot.info),
         })
         .await;
     for diagnostic in snapshot.diagnostics {

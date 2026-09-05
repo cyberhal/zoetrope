@@ -190,3 +190,22 @@ regression. The shared low-contrast edges and crowded final footer hint remain
 baseline design debt outside this feature's scope. The A/B composite is the
 durable report; generated diff telemetry was treated only as navigation aid
 because the two fixtures intentionally have different graph geometry.
+
+### Overview and metadata readability
+
+The sanitized [readability fixture](../../../tests/fixtures/codex/readability.jsonl)
+drives the final [overview](assets/readability-graph.png),
+[agent details](assets/readability-details.png), and
+[session information](assets/readability-info.png) captures. These are production
+Ratatui buffers rendered at a fixed playhead and rasterized with a monospace font,
+not OS-terminal screenshots. Same-fixture captures against the pre-change build
+were byte-different on all three surfaces; full images and enlarged crops were
+checked independently.
+
+The first critique found insufficient contrast in operation summaries, assigned
+tasks, and session values. These use body-text contrast in the final captures;
+the final critique confirmed their readability without new overlap or glyph
+defects. Existing faint timeline/provenance text, connector gaps behind chips,
+and deliberate ellipses in the narrow split-view graph remain shared UI debt.
+The [architecture](../../../docs/ARCHITECTURE.md#fold-competing-facts-by-evidence)
+owns the summary, task-link, and root-only metadata contracts behind these views.

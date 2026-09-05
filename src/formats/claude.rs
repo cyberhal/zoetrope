@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 
-use super::summary::{short_path, truncate_summary};
+use super::summary::{short_path, task_description, truncate_summary};
 use crate::event::{
     ActorId, AgentCompletionPolicy, AgentDescriptor, AgentMetadataPatch, AgentRole,
     AssistantChannel, EventKind, EventTime, Provider, RecordedAgentStatus, SessionEvent,
@@ -292,6 +292,7 @@ impl ClaudeDecoder {
                         tool_call_id: Some(id.clone()),
                         time: timestamp.map_or(EventTime::Untimed, EventTime::At),
                         preceding_context: nearest.clone(),
+                        task_description: task_description(&tool.input),
                     });
                     events.push(self.event(
                         timestamp,
@@ -426,6 +427,7 @@ pub fn decode_subagent_metadata(
                     tool_call_id: None,
                     time: EventTime::AtAgentStart(ActorId(agent_id.to_owned())),
                     preceding_context: None,
+                    task_description: None,
                 },
                 spawn_reference: None,
                 completion_policy: AgentCompletionPolicy::InferFromSilence,
@@ -441,6 +443,7 @@ pub fn decode_subagent_metadata(
         tool_call_id: meta.tool_use_id.clone(),
         time: EventTime::AtAgentStart(ActorId(agent_id.to_owned())),
         preceding_context: None,
+        task_description: None,
     };
     let interactive = meta.agent_type.as_deref() == Some("fork");
     events.push(SessionEvent {

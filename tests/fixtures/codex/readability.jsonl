@@ -1,0 +1,13 @@
+{"timestamp":"2026-09-01T10:00:00Z","type":"session_meta","payload":{"id":"readability","cwd":"/workspace/demo","source":"cli"}}
+{"timestamp":"2026-09-01T10:00:01Z","type":"turn_context","payload":{"turn_id":"review","model":"gpt-test","approval_policy":"on-request","sandbox_policy":{"type":"workspace-write"},"active_permission_profile":{"id":"workspace-default"},"collaboration_mode":{"mode":"plan"},"effort":"high"}}
+{"timestamp":"2026-09-01T10:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Improve Codex session readability"}}
+{"timestamp":"2026-09-01T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"I will ask two reviewers to inspect parsing and presentation."}]}}
+{"timestamp":"2026-09-01T10:00:04Z","type":"response_item","payload":{"type":"function_call","call_id":"spawn-parser","name":"spawn_agent","arguments":"{\"task_name\":\"parser\",\"message\":\"Review event ordering and ownership\"}"}}
+{"timestamp":"2026-09-01T10:00:04Z","type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"spawn-parser","kind":"started","agent_thread_id":"parser","agent_path":"/root/parser"}}
+{"timestamp":"2026-09-01T10:00:05Z","type":"response_item","payload":{"type":"function_call_output","call_id":"spawn-parser","output":"{\"task_name\":\"/root/parser\"}"}}
+{"timestamp":"2026-09-01T10:00:06Z","type":"response_item","payload":{"type":"function_call","call_id":"spawn-display","name":"spawn_agent","arguments":"{\"task_name\":\"display\",\"message\":\"Check readable labels and metadata\"}"}}
+{"timestamp":"2026-09-01T10:00:06Z","type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"spawn-display","kind":"started","agent_thread_id":"display","agent_path":"/root/display"}}
+{"timestamp":"2026-09-01T10:00:07Z","type":"response_item","payload":{"type":"function_call_output","call_id":"spawn-display","output":"{\"task_name\":\"/root/display\"}"}}
+{"timestamp":"2026-09-01T10:00:08Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"image","name":"exec","input":"image(await tools.view_image({path: '/workspace/demo/out.png'}));"}}
+{"timestamp":"2026-09-01T10:00:09Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"check-a","name":"exec","input":"text(await tools.exec_command({cmd: 'cargo check --lib'}));"}}
+{"timestamp":"2026-09-01T10:00:10Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"check-b","name":"exec","input":"text(await tools.exec_command({cmd: 'cargo check --lib'}));"}}

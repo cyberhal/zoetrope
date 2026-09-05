@@ -185,6 +185,7 @@ impl App {
     /// Construct the initial app state for a session id and mode, with an empty
     /// configured flow and a fresh model.
     pub fn new(session: crate::event::SessionKey, mode: Mode) -> Self {
+        let session_info = SessionInfo::new(session.provider);
         App {
             flow: graph::new_flow(),
             session: SessionModel::new(session.clone()),
@@ -205,7 +206,7 @@ impl App {
             scrubber_tally: None,
             era_cache: None,
             last_batch_at: None,
-            session_info: SessionInfo::default(),
+            session_info,
             show_info: false,
             pending_center: None,
             pending_seek: None,
@@ -319,8 +320,7 @@ impl App {
                 // real activity (timestamped / dated) goes on the timeline.
                 let mut activity = Vec::with_capacity(events.len());
                 for event in events {
-                    if let crate::event::EventKind::SessionInfo(patch) = &event.kind {
-                        self.session_info.apply(patch);
+                    if self.session_info.consume(&event, &self.current_session) {
                         continue;
                     }
                     activity.push(event);
@@ -364,7 +364,7 @@ impl App {
                 }
                 // Bulk hand-off: the App owns pacing from here. Fold the first
                 // moment immediately so t=0 renders; `tick_timeline` paces on.
-                self.session_info = info;
+                self.session_info = *info;
                 self.timeline.load_replay(items, speed);
                 if self.mode == Mode::Live {
                     // `--follow` on a file: ride the (possibly growing) edge
@@ -385,6 +385,7 @@ impl App {
                 // waiting for the session to appear.
                 let genuine = !self.is_current(&session) || self.flow.nodes().count() > 0;
                 self.current_session = session.clone();
+                self.session_info = SessionInfo::new(session.provider);
                 self.session = SessionModel::new(session);
                 self.flow = graph::new_flow();
                 // A reset is a fresh timeline. Feeders announce the identity
